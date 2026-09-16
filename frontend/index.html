@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+
+<html lang="pt-BR">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0">
+
+    <title>GAM Copier</title>
+
+    style.css
+
+</head>
+
+<body>
+
+    <div class="container">
+
+        <h1>Google Ad Manager</h1>
+
+        <label for="source">
+            Line Item Origem
+        </label>
+
+        <input
+            id="source"
+            type="number"
+            placeholder="Digite o ID de origem">
+
+        <label for="target">
+            Line Item Destino
+        </label>
+
+        <input
+            id="target"
+            type="number"
+            placeholder="Digite o ID de destino">
+
+        <button onclick="copyLineItem()">
+            Copiar Configuração
+        </button>
+
+        <div id="msg"></div>
+
+    </div>
+
+    <script src="app.js"></script>
+
+</body>
+
+</html>
