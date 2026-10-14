@@ -1,11 +1,15 @@
-NETWORK_CODE = "95377733"
+import os
 
-API_VERSION = "v202505"
+NETWORK_CODE = os.getenv("GAM_NETWORK_CODE", "32352161")
 
-APPLICATION_NAME = (
+APPLICATION_NAME = os.getenv(
+    "GAM_APPLICATION_NAME",
     "GAM Line Item Copier"
 )
 
-SERVICE_ACCOUNT_FILE = (
-    "service-account.json"
+API_VERSION = os.getenv(
+    "GAM_API_VERSION",
+    "v202608"
 )
+
+ADMANAGER_SCOPE = "https://www.googleapis.com/auth/admanager"
