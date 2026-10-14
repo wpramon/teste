@@ -1,413 +1,863 @@
 """
-GAM Line Item Copier
-====================
+Cópia de configurações e LICAs entre Line Items do Google Ad Manager.
 
-Execucao:
-    python backend/gam_copy.py
+Autenticação:
+    Application Default Credentials, ADC.
 
-Variaveis de ambiente:
-    GAM_NETWORK_CODE
-    GAM_SOURCE_LINE_ITEM_ID
-    GAM_DESTINATION_LINE_ITEM_ID
+No Cloud Run:
+    Usa automaticamente a Service Account anexada ao serviço.
 
-Autenticacao:
-    Application Default Credentials (ADC).
+Não utiliza:
+    service-account.json
+    private_key
+    GOOGLE_APPLICATION_CREDENTIALS
 
-No GitHub Actions, as credenciais devem ser disponibilizadas
-antes da execucao deste script pela etapa de autenticacao
-com Google Cloud / Workload Identity Federation.
+Regra da cópia:
+    Copia configurações operacionais e LICAs.
+    Preserva nome, Order, status, datas, Goals e Cost Settings do destino.
 """
 
+from copy import deepcopy
+from typing import Any, Dict, List, Optional
+import argparse
+import json
 import os
 import sys
-import logging
-from typing import Any
 
 import google.auth
-from google.auth.transport.requests import AuthorizedSession
+from google.auth.transport.requests import Request
+from googleads import ad_manager
+
+try:
+    from config import (
+        NETWORK_CODE,
+        APPLICATION_NAME,
+        API_VERSION,
+        ADMANAGER_SCOPE,
+    )
+except ImportError:
+    # Permite executar também como pacote:
+    # python -m backend.app
+    from backend.config import (
+        NETWORK_CODE,
+        APPLICATION_NAME,
+        API_VERSION,
+        ADMANAGER_SCOPE,
+    )
 
 
 # ============================================================
-# CONFIGURACAO
+# CONFIGURAÇÕES DE CÓPIA
 # ============================================================
 
-NETWORK_CODE = os.getenv("GAM_NETWORK_CODE", "32352161")
-
-SOURCE_LINE_ITEM_ID = os.getenv("GAM_SOURCE_LINE_ITEM_ID")
-DESTINATION_LINE_ITEM_ID = os.getenv("GAM_DESTINATION_LINE_ITEM_ID")
-
-AD_MANAGER_SCOPE = "https://www.googleapis.com/auth/admanager"
-
-API_ROOT = "https://admanager.googleapis.com/v1"
-
-
-# ============================================================
-# LOG
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-logger = logging.getLogger("gam-copy")
-
-
-# ============================================================
-# CAMPOS QUE PODEM SER COPIADOS
-# ============================================================
-
-# Estes campos sao deliberadamente controlados.
+# Somente estes campos serão copiados.
 #
-# Nao copiamos:
-# - ID
-# - nome
-# - order
-# - status
-# - datas
-# - goal
-# - cost settings
-#
-# Dessa maneira o Line Item de destino mantem sua identidade.
-
+# Cost Settings e Goals não aparecem nesta lista e, portanto,
+# permanecem exatamente como estão no Line Item de destino.
 FIELDS_TO_COPY = [
+    # Segmentação completa
     "targeting",
+
+    # Tamanhos e configurações esperadas dos criativos
     "creativePlaceholders",
+
+    # Configurações de entrega
+    "deliveryRateType",
+    "creativeRotationType",
+    "roadblockingType",
     "environmentType",
+    "companionDeliveryOption",
+
+    # Frequência
+    "frequencyCaps",
+
+    # Inventário
     "allowOverbook",
     "skipInventoryCheck",
+
+    # Previsão de entrega
+    "deliveryForecastSource",
+]
+
+# Campos explicitamente preservados no destino.
+#
+# Esta lista também serve para documentação e validação.
+PRESERVED_FIELDS = [
+    # Identificação
+    "id",
+    "name",
+    "orderId",
+    "status",
+
+    # Datas
+    "startDateTime",
+    "endDateTime",
+    "startDateTimeType",
+    "unlimitedEndDateTime",
+
+    # Goals
+    "primaryGoal",
+    "secondaryGoals",
+
+    # Cost Settings
+    "costType",
+    "costPerUnit",
+    "valueCostPerUnit",
+    "discountType",
+    "discount",
+
+    # Quantidades, orçamento e contratação
+    "budget",
+    "contractedUnitsBought",
+
+    # Campos calculados e somente leitura
+    "stats",
+    "deliveryIndicator",
+    "reservationStatus",
+    "creationDateTime",
+    "lastModifiedDateTime",
+    "isMissingCreatives",
 ]
 
 
 # ============================================================
-# AUTENTICACAO
+# AUTENTICAÇÃO ADC PARA A BIBLIOTECA SOAP GOOGLEADS
 # ============================================================
 
-def get_authenticated_session() -> AuthorizedSession:
+class AdManagerADCClient:
     """
-    Obtem credenciais usando Application Default Credentials.
+    Adaptador entre google-auth ADC e a biblioteca SOAP googleads.
 
-    GitHub Actions:
-        Workload Identity Federation -> ADC
-
-    Google Cloud:
-        Service Account anexada ao workload -> ADC
-
-    Local:
-        gcloud auth application-default login
+    A biblioteca googleads espera que o objeto OAuth forneça
+    CreateHttpHeader(). Este adaptador obtém e renova o token
+    via Application Default Credentials.
     """
 
-    logger.info("Obtendo credenciais via ADC...")
-
-    credentials, project_id = google.auth.default(
-        scopes=[AD_MANAGER_SCOPE]
-    )
-
-    if project_id:
-        logger.info("Google Cloud Project: %s", project_id)
-
-    credentials.refresh(
-        google.auth.transport.requests.Request()
-    )
-
-    logger.info("Autenticacao realizada.")
-
-    return AuthorizedSession(credentials)
-
-
-# ============================================================
-# HTTP
-# ============================================================
-
-def api_get(
-    session: AuthorizedSession,
-    resource: str,
-) -> dict[str, Any]:
-
-    url = f"{API_ROOT}/{resource}"
-
-    logger.info("GET %s", url)
-
-    response = session.get(url, timeout=60)
-
-    if not response.ok:
-        raise RuntimeError(
-            "Erro no Ad Manager API.\n"
-            f"HTTP: {response.status_code}\n"
-            f"Resposta: {response.text}"
+    def __init__(self, scopes: List[str]) -> None:
+        self.credentials, self.project_id = google.auth.default(
+            scopes=scopes
         )
 
-    return response.json()
+        self._request = Request()
+
+    def _ensure_valid_token(self) -> None:
+        """
+        Renova o token quando ele não existe ou expirou.
+        """
+
+        if (
+            not self.credentials.valid
+            or self.credentials.expired
+            or not self.credentials.token
+        ):
+            self.credentials.refresh(self._request)
+
+    def CreateHttpHeader(self) -> Dict[str, str]:
+        """
+        Método esperado pelo googleads.AdManagerClient.
+        """
+
+        self._ensure_valid_token()
+
+        return {
+            "Authorization": (
+                f"Bearer {self.credentials.token}"
+            )
+        }
+
+    def Refresh(self) -> None:
+        """
+        Compatibilidade adicional com clientes que chamam Refresh().
+        """
+
+        self.credentials.refresh(self._request)
+
+    @property
+    def access_token(self) -> Optional[str]:
+        """
+        Expõe o access token para compatibilidade.
+        """
+
+        self._ensure_valid_token()
+        return self.credentials.token
 
 
-def api_patch(
-    session: AuthorizedSession,
-    resource: str,
-    body: dict[str, Any],
-    update_mask: list[str],
-) -> dict[str, Any]:
+# ============================================================
+# CRIAÇÃO DO CLIENTE
+# ============================================================
 
-    url = f"{API_ROOT}/{resource}"
+def get_client() -> ad_manager.AdManagerClient:
+    """
+    Cria o cliente SOAP do Google Ad Manager usando ADC.
 
-    params = {
-        "updateMask": ",".join(update_mask)
-    }
+    No Cloud Run, ADC usa automaticamente a Service Account
+    configurada no serviço.
+    """
 
-    logger.info("PATCH %s", url)
-    logger.info(
-        "Campos que serao atualizados: %s",
-        ", ".join(update_mask),
+    oauth_client = AdManagerADCClient(
+        scopes=[ADMANAGER_SCOPE]
     )
 
-    response = session.patch(
-        url,
-        params=params,
-        json=body,
-        timeout=60,
+    client = ad_manager.AdManagerClient(
+        oauth2_client=oauth_client,
+        application_name=APPLICATION_NAME,
+        network_code=str(NETWORK_CODE),
     )
 
-    if not response.ok:
-        raise RuntimeError(
-            "Erro ao atualizar Line Item.\n"
-            f"HTTP: {response.status_code}\n"
-            f"Resposta: {response.text}"
+    return client
+
+
+# ============================================================
+# FUNÇÕES AUXILIARES
+# ============================================================
+
+def _get_results(response: Any) -> List[Any]:
+    """
+    Obtém a lista results de respostas SOAP do tipo dict ou suds.
+    """
+
+    if not response:
+        return []
+
+    if isinstance(response, dict):
+        return response.get("results", []) or []
+
+    return getattr(response, "results", []) or []
+
+
+def _get_field(
+    item: Any,
+    field: str,
+    default: Any = None,
+) -> Any:
+    """
+    Lê um campo tanto de dict quanto de objeto retornado pelo SOAP.
+    """
+
+    if item is None:
+        return default
+
+    if isinstance(item, dict):
+        return item.get(field, default)
+
+    return getattr(item, field, default)
+
+
+def _has_field(item: Any, field: str) -> bool:
+    """
+    Verifica se um objeto SOAP ou dict possui determinado campo.
+    """
+
+    if isinstance(item, dict):
+        return field in item
+
+    return hasattr(item, field)
+
+
+def _set_field(
+    item: Any,
+    field: str,
+    value: Any,
+) -> None:
+    """
+    Define um campo em dict ou objeto SOAP.
+    """
+
+    if isinstance(item, dict):
+        item[field] = value
+    else:
+        setattr(item, field, value)
+
+
+def _validate_line_item_id(
+    line_item_id: Any,
+    field_name: str,
+) -> int:
+    """
+    Valida e normaliza um ID de Line Item.
+    """
+
+    try:
+        normalized_id = int(line_item_id)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"{field_name} deve ser um número inteiro."
+        ) from error
+
+    if normalized_id <= 0:
+        raise ValueError(
+            f"{field_name} deve ser maior que zero."
         )
 
-    return response.json()
+    return normalized_id
 
-
-# ============================================================
-# LINE ITEMS
-# ============================================================
 
 def get_line_item(
-    session: AuthorizedSession,
-    line_item_id: str,
-) -> dict[str, Any]:
+    line_item_service: Any,
+    line_item_id: int,
+) -> Any:
+    """
+    Busca um Line Item pelo ID.
+    """
 
-    resource = (
-        f"networks/{NETWORK_CODE}"
-        f"/lineItems/{line_item_id}"
+    statement = (
+        ad_manager.StatementBuilder(version=API_VERSION)
+        .Where("id = :line_item_id")
+        .WithBindVariable(
+            "line_item_id",
+            line_item_id,
+        )
+        .Limit(1)
     )
 
-    logger.info(
-        "Obtendo Line Item %s...",
-        line_item_id,
+    response = line_item_service.getLineItemsByStatement(
+        statement.ToStatement()
     )
 
-    line_item = api_get(
-        session,
-        resource,
+    results = _get_results(response)
+
+    if not results:
+        raise LookupError(
+            f"Line Item {line_item_id} não encontrado "
+            f"na rede {NETWORK_CODE}."
+        )
+
+    return results[0]
+
+
+def get_licas(
+    lica_service: Any,
+    line_item_id: int,
+) -> List[Any]:
+    """
+    Busca todas as LICAs de um Line Item usando paginação.
+    """
+
+    statement_builder = (
+        ad_manager.StatementBuilder(version=API_VERSION)
+        .Where("lineItemId = :line_item_id")
+        .WithBindVariable(
+            "line_item_id",
+            line_item_id,
+        )
+        .Limit(500)
     )
 
-    logger.info(
-        "Line Item encontrado: %s",
-        line_item.get("displayName")
-        or line_item.get("name")
-        or line_item_id,
-    )
+    licas: List[Any] = []
 
-    return line_item
-
-
-# ============================================================
-# PREPARACAO
-# ============================================================
-
-def prepare_line_item_update(
-    source: dict[str, Any],
-) -> tuple[dict[str, Any], list[str]]:
-
-    body: dict[str, Any] = {}
-
-    update_mask: list[str] = []
-
-    for field in FIELDS_TO_COPY:
-
-        if field not in source:
-            logger.warning(
-                "Campo '%s' nao existe no Line Item origem.",
-                field,
+    while True:
+        response = (
+            lica_service
+            .getLineItemCreativeAssociationsByStatement(
+                statement_builder.ToStatement()
             )
-            continue
+        )
 
-        body[field] = source[field]
-        update_mask.append(field)
+        page_results = _get_results(response)
 
-    return body, update_mask
+        if not page_results:
+            break
+
+        licas.extend(page_results)
+
+        statement_builder.offset += (
+            statement_builder.limit
+        )
+
+    return licas
 
 
-# ============================================================
-# COPIA
-# ============================================================
+def delete_target_licas(
+    lica_service: Any,
+    target_id: int,
+) -> int:
+    """
+    Remove todas as LICAs existentes no Line Item destino.
 
-def copy_line_item_settings(
-    session: AuthorizedSession,
-    source_id: str,
-    destination_id: str,
-) -> dict[str, Any]:
+    Retorna a quantidade informada pela operação, quando disponível.
+    """
 
-    logger.info("=" * 60)
-    logger.info("COPIA DE CONFIGURACOES DO LINE ITEM")
-    logger.info("=" * 60)
-
-    logger.info(
-        "Rede GAM........: %s",
-        NETWORK_CODE,
+    statement = (
+        ad_manager.StatementBuilder(version=API_VERSION)
+        .Where("lineItemId = :line_item_id")
+        .WithBindVariable(
+            "line_item_id",
+            target_id,
+        )
+        .ToStatement()
     )
 
-    logger.info(
-        "Line Item origem: %s",
+    action = {
+        "xsi_type":
+            "DeleteLineItemCreativeAssociations"
+    }
+
+    result = (
+        lica_service
+        .performLineItemCreativeAssociationAction(
+            action,
+            statement,
+        )
+    )
+
+    num_changes = _get_field(
+        result,
+        "numChanges",
+        0,
+    )
+
+    return int(num_changes or 0)
+
+
+def build_target_lica(
+    source_lica: Any,
+    target_id: int,
+) -> Dict[str, Any]:
+    """
+    Cria o payload de uma nova LICA para o destino.
+
+    Somente campos apropriados para criação são incluídos.
+    Campos somente leitura como id, status e stats não são copiados.
+    """
+
+    creative_id = _get_field(
+        source_lica,
+        "creativeId",
+    )
+
+    if not creative_id:
+        raise ValueError(
+            "A LICA de origem não possui creativeId."
+        )
+
+    new_lica: Dict[str, Any] = {
+        "lineItemId": target_id,
+        "creativeId": creative_id,
+    }
+
+    optional_fields = [
+        "sizes",
+        "startDateTime",
+        "endDateTime",
+        "manualCreativeRotationWeight",
+        "sequentialCreativeRotationIndex",
+        "destinationUrl",
+    ]
+
+    for field in optional_fields:
+        value = _get_field(
+            source_lica,
+            field,
+            None,
+        )
+
+        if value is not None:
+            new_lica[field] = deepcopy(value)
+
+    return new_lica
+
+
+def create_licas_in_batches(
+    lica_service: Any,
+    new_licas: List[Dict[str, Any]],
+    batch_size: int = 100,
+) -> int:
+    """
+    Cria LICAs em lotes para evitar requisições muito grandes.
+    """
+
+    total_created = 0
+
+    for start in range(
+        0,
+        len(new_licas),
+        batch_size,
+    ):
+        batch = new_licas[
+            start:start + batch_size
+        ]
+
+        created = (
+            lica_service
+            .createLineItemCreativeAssociations(
+                batch
+            )
+        )
+
+        total_created += len(created or [])
+
+    return total_created
+
+
+# ============================================================
+# FUNÇÃO PRINCIPAL
+# ============================================================
+
+def copiar_configuracao(
+    source_id: Any,
+    target_id: Any,
+) -> Dict[str, Any]:
+    """
+    Copia configurações operacionais e LICAs do Line Item origem
+    para um Line Item destino já existente.
+
+    Preserva no destino:
+        - ID
+        - nome
+        - Order
+        - status
+        - datas
+        - Goals
+        - Cost Settings
+        - orçamento e quantidade contratada
+
+    Substitui no destino:
+        - targeting
+        - creativePlaceholders
+        - frequência
+        - pacing e rotação
+        - roadblocking
+        - demais campos definidos em FIELDS_TO_COPY
+        - todas as LICAs
+
+    Atenção:
+        As LICAs atuais do destino são excluídas antes da criação
+        das LICAs copiadas da origem.
+    """
+
+    source_id = _validate_line_item_id(
         source_id,
+        "ID do Line Item de origem",
     )
 
-    logger.info(
-        "Line Item destino: %s",
-        destination_id,
+    target_id = _validate_line_item_id(
+        target_id,
+        "ID do Line Item de destino",
+    )
+
+    if source_id == target_id:
+        raise ValueError(
+            "O Line Item de origem e o de destino "
+            "não podem ser iguais."
+        )
+
+    client = get_client()
+
+    line_item_service = client.GetService(
+        "LineItemService",
+        version=API_VERSION,
+    )
+
+    lica_service = client.GetService(
+        "LineItemCreativeAssociationService",
+        version=API_VERSION,
     )
 
     # --------------------------------------------------------
-    # ORIGEM
+    # Buscar origem e destino
     # --------------------------------------------------------
 
     source = get_line_item(
-        session,
+        line_item_service,
         source_id,
     )
 
-    # --------------------------------------------------------
-    # DESTINO
-    # --------------------------------------------------------
-
-    destination = get_line_item(
-        session,
-        destination_id,
+    target = get_line_item(
+        line_item_service,
+        target_id,
     )
 
-    logger.info(
-        "Origem : %s",
-        source.get("displayName")
-        or source.get("name"),
+    source_name = _get_field(
+        source,
+        "name",
+        str(source_id),
     )
 
-    logger.info(
-        "Destino: %s",
-        destination.get("displayName")
-        or destination.get("name"),
+    target_name = _get_field(
+        target,
+        "name",
+        str(target_id),
     )
 
     # --------------------------------------------------------
-    # PREPARAR ALTERACOES
+    # Backup em memória dos campos que devem permanecer
     # --------------------------------------------------------
 
-    body, update_mask = prepare_line_item_update(
-        source
+    preserved_values: Dict[str, Any] = {}
+
+    for field in PRESERVED_FIELDS:
+        if _has_field(target, field):
+            preserved_values[field] = deepcopy(
+                _get_field(target, field)
+            )
+
+    # --------------------------------------------------------
+    # Copiar somente configurações autorizadas
+    # --------------------------------------------------------
+
+    copied_fields: List[str] = []
+
+    for field in FIELDS_TO_COPY:
+        if _has_field(source, field):
+            source_value = _get_field(
+                source,
+                field,
+            )
+
+            _set_field(
+                target,
+                field,
+                deepcopy(source_value),
+            )
+
+            copied_fields.append(field)
+
+    # Reaplica os campos protegidos antes da atualização.
+    # É uma proteção adicional contra alterações acidentais.
+    for field, value in preserved_values.items():
+        _set_field(
+            target,
+            field,
+            deepcopy(value),
+        )
+
+    # --------------------------------------------------------------
+    # Atualizar o Line Item destino
+    # --------------------------------------------------------
+
+    updated_items = (
+        line_item_service
+        .updateLineItems([target])
     )
 
-    if not update_mask:
+    if not updated_items:
         raise RuntimeError(
-            "Nenhum campo disponivel para copia."
+            "O Google Ad Manager não retornou o Line Item "
+            "após a atualização."
         )
-
-    logger.info("-" * 60)
-    logger.info("Campos selecionados para copia:")
-
-    for field in update_mask:
-        logger.info("  -> %s", field)
 
     # --------------------------------------------------------
-    # ALTERAR DESTINO
-    # -------------------------------------------------------------
+    # Consultar LICAs antes de modificar o destino
+    # --------------------------------------------------------
 
-    destination_resource = (
-        f"networks/{NETWORK_CODE}"
-        f"/lineItems/{destination_id}"
+    source_licas = get_licas(
+        lica_service,
+        source_id,
     )
 
-    result = api_patch(
-        session=session,
-        resource=destination_resource,
-        body=body,
-        update_mask=update_mask,
+    target_licas = get_licas(
+        lica_service,
+        target_id,
     )
 
-    logger.info("=" * 60)
-    logger.info("Line Item atualizado.")
-    logger.info("=" * 60)
+    source_lica_count = len(source_licas)
+    previous_target_lica_count = len(target_licas)
 
-    return result
+    # --------------------------------------------------------
+    # Preparar as LICAs antes de apagar as atuais
+    # --------------------------------------------------------
 
+    new_licas = [
+        build_target_lica(
+            source_lica,
+            target_id,
+        )
+        for source_lica in source_licas
+    ]
 
-# ============================================================
-# ARGUMENTOS
-# ============================================================
+    # --------------    # --------------------------------------------------------
+    # Substituir as LICAs no destino
+    # --------------------------------------------------------
 
-def get_line_item_ids() -> tuple[str, str\]:
+    deleted_lica_count = 0
+    created_lica_count = 0
 
-    source = SOURCE_LINE_ITEM_ID
-    destination = DESTINATION_LINE_ITEM_ID
-
-    # Tambem permite:
-    #
-    # python gam_copy.py 123456 987654
-
-    if len(sys.argv) >= 3:
-  source = sys.argv[1]
-        destination = sys.argv[2]
-
-    if not source:
-        raise ValueError(
-            "Informe GAM_SOURCE_LINE_ITEM_ID."
+    if target_licas:
+        deleted_lica_count = delete_target_licas(
+            lica_service,
+            target_id,
         )
 
-    if not destination:
-        raise ValueError(
-            "Informe GAM_DESTINATION_LINE_ITEM_ID."
+    if new_licas:
+        created_lica_count = create_licas_in_batches(
+            lica_service,
+            new_licas,
         )
 
-    if source == destination:
-        raise ValueError(
-            "Line Item origem e destino nao podem ser iguais."
+    # --------------------------------------------------------
+    # Validar o resultado
+    # --------------------------------------------------------
+
+    final_target_licas = get_licas(
+        lica_service,
+        target_id,
+    )
+
+    final_target_lica_count = len(
+        final_target_licas
+    )
+
+    if (
+        source_lica_count
+        != final_target_lica_count
+    ):
+        raise RuntimeError(
+            "As configurações do Line Item foram atualizadas, "
+            "mas a validação das LICAs encontrou divergência. "
+            f"Origem: {source_lica_count}; "
+            f"destino após a cópia: "
+            f"{final_target_lica_count}."
         )
 
-    return source, destination
-
+    return {
+        "message": (
+            "Configurações e LICAs copiadas com sucesso."
+        ),
+        "network_code": str(NETWORK_CODE),
+        "source": {
+            "id": source_id,
+            "name": source_name,
+            "lica_count": source_lica_count,
+        },
+        "target": {
+            "id": target_id,
+            "name": target_name,
+            "previous_lica_count":
+                previous_target_lica_count,
+            "deleted_lica_count":
+                deleted_lica_count,
+            "created_lica_count":
+                created_lica_count,
+            "final_lica_count":
+                final_target_lica_count,
+        },
+        "copied_fields": copied_fields,
+        "preserved_groups": [
+            "Identificação",
+            "Order",
+            "Status",
+            "Datas",
+            "Goals",
+            "Cost Settings",
+            "Budget",
+            "Quantidade contratada",
+        ],
+    }
 
 # ============================================================
-# MAIN
+# EXECUÇÃO DIRETA E GITHUB ACTIONS
 # ============================================================
 
-def main() -> None:
+def _read_id(
+    cli_value: Optional[str],
+    environment_name: str,
+) -> Optional[str]:
+    """Prioriza o argumento da linha de comando e depois a variável de ambiente."""
+    if cli_value not in (None, ""):
+        return cli_value
+    value = os.getenv(environment_name)
+    return value if value not in (None, "") else None
+
+
+def main() -> int:
+    """
+    Permite executar este arquivo diretamente.
+
+    Exemplos:
+        python backend/gam_copy.py --source-id 123 --target-id 456
+
+    No GitHub Actions, também aceita:
+        GAM_SOURCE_LINE_ITEM_ID
+        GAM_TARGET_LINE_ITEM_ID
+
+    A saída final é impressa em JSON e também gravada no resumo
+    do GitHub Actions quando GITHUB_STEP_SUMMARY estiver disponível.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Copia configurações operacionais e LICAs entre "
+            "Line Items existentes do Google Ad Manager."
+        )
+    )
+    parser.add_argument(
+        "--source-id",
+        dest="source_id",
+        help="ID do Line Item de origem.",
+    )
+    parser.add_argument(
+        "--target-id",
+        dest="target_id",
+        help="ID do Line Item de destino.",
+    )
+    args = parser.parse_args()
+
+    source_id = _read_id(
+        args.source_id,
+        "GAM_SOURCE_LINE_ITEM_ID",
+    )
+    target_id = _read_id(
+        args.target_id,
+        "GAM_TARGET_LINE_ITEM_ID",
+    )
+
+    if source_id is None or target_id is None:
+        parser.error(
+            "Informe --source-id e --target-id, ou defina "
+            "GAM_SOURCE_LINE_ITEM_ID e GAM_TARGET_LINE_ITEM_ID."
+        )
 
     try:
-
-        logger.info("")
-        logger.info("GAM Line Item Copier")
-        logger.info("Rede: %s", NETWORK_CODE)
-        logger.info("")
-
-        source_id, destination_id = get_line_item_ids()
-
-        session = get_authenticated_session()
-
-        copy_line_item_settings(
-            session=session,
+        result = copiar_configuracao(
             source_id=source_id,
-            destination_id=destination_id,
+            target_id=target_id,
         )
 
-        logger.info("")
-        logger.info("Processo concluido com sucesso.")
-
-    except Exception as exc:
-
-        logger.exception(
-            "Falha durante a execucao: %s",
-            exc,
+        output = json.dumps(
+            result,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
         )
+        print(output)
 
-        sys.exit(1)
+        summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+        if summary_path:
+            source = result["source"]
+            target = result["target"]
+            copied_fields = ", ".join(result["copied_fields"])
+
+            summary = (
+                "# GAM Line Item Copier\n\n"
+                "## Resultado\n\n"
+                f"- **Rede:** {result['network_code']}\n"
+                f"- **Origem:** {source['id']} - {source['name']}\n"
+                f"- **Destino:** {target['id']} - {target['name']}\n"
+                f"- **LICAs na origem:** {source['lica_count']}\n"
+                f"- **LICAs anteriores no destino:** "
+                f"{target['previous_lica_count']}\n"
+                f"- **LICAs criadas no destino:** "
+                f"{target['created_lica_count']}\n"
+                f"- **LICAs finais no destino:** "
+                f"{target['final_lica_count']}\n"
+                f"- **Campos copiados:** {copied_fields}\n"
+            )
+
+            with open(
+                summary_path,
+                "a",
+                encoding="utf-8",
+            ) as summary_file:
+                summary_file.write(summary)
+
+        return 0
+
+    except Exception as error:
+        print(
+            f"Erro ao copiar configurações e LICAs: {error}",
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
