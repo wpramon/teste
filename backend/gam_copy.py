@@ -22,7 +22,6 @@ from typing import Any, Dict, List, Optional
 import argparse
 import json
 import os
-import re
 import sys
 
 import google.auth
@@ -61,6 +60,9 @@ FIELDS_TO_COPY = [
 
     # Tamanhos e configurações esperadas dos criativos
     "creativePlaceholders",
+
+    # Creative-level targeting deve viajar junto com os placeholders.
+    "creativeTargetings",
 
     # Configurações de entrega
     "deliveryRateType",
@@ -291,138 +293,6 @@ def _validate_line_item_id(
         )
 
     return normalized_id
-
-
-def _parse_codes(raw: str, label: str) -> List[str]:
-    """Aceita códigos separados por vírgula, ponto e vírgula ou quebra de linha."""
-    values = [item.strip() for item in re.split(r"[,;\n]+", raw or "") if item.strip()]
-    if not values:
-        raise ValueError(f"{label} não pode ficar vazio.")
-    invalid = [value for value in values if not re.fullmatch(r"\d{5}", value)]
-    if invalid:
-        raise ValueError(
-            f"{label}: cada identificador deve ter exatamente 5 dígitos. "
-            f"Inválidos: {', '.join(invalid)}"
-        )
-    return values
-
-
-def _name_contains_code(name: str, code: str) -> bool:
-    """Confere o código de 5 dígitos como token numérico, evitando parte de número maior."""
-    return re.search(rf"(?<!\d){re.escape(code)}(?!\d)", name or "") is not None
-
-
-def find_line_item_by_name_code(
-    line_item_service: Any,
-    code: str,
-) -> Any:
-    """
-    Localiza um Line Item pelo código de 5 dígitos existente no nome.
-    Exige correspondência única na rede para evitar pareamento incorreto.
-    """
-    statement_builder = (
-        ad_manager.StatementBuilder(version=API_VERSION)
-        .Where("name LIKE :name_pattern")
-        .WithBindVariable("name_pattern", f"%{code}%")
-        .Limit(500)
-    )
-    matches: List[Any] = []
-    while True:
-        response = line_item_service.getLineItemsByStatement(
-            statement_builder.ToStatement()
-        )
-        results = _get_results(response)
-        if not results:
-            break
-        matches.extend(
-            item for item in results
-            if _name_contains_code(str(_get_field(item, "name", "")), code)
-        )
-        statement_builder.offset += statement_builder.limit
-
-    if not matches:
-        raise LookupError(
-            f"Nenhum Line Item encontrado com o código {code} no nome."
-        )
-    if len(matches) > 1:
-        details = "; ".join(
-            f"{_get_field(item, 'id')} - {_get_field(item, 'name')}"
-            for item in matches[:10]
-        )
-        raise LookupError(
-            f"O código {code} encontrou {len(matches)} Line Items. "
-            f"A correspondência precisa ser única. Encontrados: {details}"
-        )
-    return matches[0]
-
-
-def resolve_batch_pairs(
-    source_codes_raw: str,
-    target_codes_raw: str,
-) -> List[Dict[str, Any]]:
-    """Resolve e valida todos os pares antes de iniciar qualquer alteração."""
-    source_codes = _parse_codes(source_codes_raw, "Origens")
-    target_codes = _parse_codes(target_codes_raw, "Destinos")
-    if len(source_codes) != len(target_codes):
-        raise ValueError(
-            "A quantidade de origens e destinos deve ser igual. "
-            f"Origens: {len(source_codes)}; destinos: {len(target_codes)}."
-        )
-    if len(set(source_codes)) != len(source_codes):
-        raise ValueError("A lista de origens contém código repetido.")
-    if len(set(target_codes)) != len(target_codes):
-        raise ValueError("A lista de destinos contém código repetido.")
-
-    client = get_client()
-    service = client.GetService("LineItemService", version=API_VERSION)
-    pairs: List[Dict[str, Any]] = []
-    for source_code, target_code in zip(source_codes, target_codes):
-        source = find_line_item_by_name_code(service, source_code)
-        target = find_line_item_by_name_code(service, target_code)
-        source_id = int(_get_field(source, "id"))
-        target_id = int(_get_field(target, "id"))
-        if source_id == target_id:
-            raise ValueError(
-                f"O par {source_code} -> {target_code} resolveu para o mesmo Line Item {source_id}."
-            )
-        pairs.append({
-            "source_code": source_code,
-            "target_code": target_code,
-            "source_id": source_id,
-            "target_id": target_id,
-            "source_name": str(_get_field(source, "name", source_id)),
-            "target_name": str(_get_field(target, "name", target_id)),
-        })
-    return pairs
-
-
-def copiar_lote_por_codigo(
-    source_codes_raw: str,
-    target_codes_raw: str,
-) -> Dict[str, Any]:
-    """
-    Copia múltiplos pares na ordem informada.
-    Todos os pares são resolvidos/validados antes da primeira alteração.
-    Cada par mantém o rollback individual de copiar_configuracao().
-    """
-    pairs = resolve_batch_pairs(source_codes_raw, target_codes_raw)
-    results: List[Dict[str, Any]] = []
-    for index, pair in enumerate(pairs, start=1):
-        print(
-            f"[{index}/{len(pairs)}] {pair['source_code']} -> {pair['target_code']} | "
-            f"{pair['source_id']} -> {pair['target_id']}"
-        )
-        result = copiar_configuracao(
-            source_id=pair["source_id"],
-            target_id=pair["target_id"],
-        )
-        results.append({"pair": pair, "result": result})
-    return {
-        "message": "Lote concluído com sucesso.",
-        "network_code": str(NETWORK_CODE),
-        "pair_count": len(results),
-        "results": results,
-    }
 
 
 def get_line_item(
@@ -735,6 +605,34 @@ def validate_source_creatives_against_placeholders(
     return creatives, native_creative_ids
 
 
+def validate_creative_targeting_references(
+    line_item: Any,
+    licas: List[Any],
+) -> None:
+    """Valida CreativeTargeting.name, placeholder.targetingName e LICA.targetingName."""
+    creative_targetings = _get_field(line_item, "creativeTargetings", []) or []
+    names = {
+        str(_get_field(item, "name"))
+        for item in creative_targetings
+        if _get_field(item, "name", None) not in (None, "")
+    }
+    referenced: set[str] = set()
+    for placeholder in (_get_field(line_item, "creativePlaceholders", []) or []):
+        name = _get_field(placeholder, "targetingName", None)
+        if name not in (None, ""):
+            referenced.add(str(name))
+    for lica in licas:
+        name = _get_field(lica, "targetingName", None)
+        if name not in (None, ""):
+            referenced.add(str(name))
+    missing = sorted(referenced - names)
+    if missing:
+        raise ValueError(
+            "Creative Targeting inconsistente na origem. Referências sem "
+            f"CreativeTargeting correspondente: {missing}."
+        )
+
+
 def build_target_lica(
     source_lica: Any,
     target_id: int,
@@ -781,6 +679,8 @@ def build_target_lica(
     # existem nos creativePlaceholders PIXEL do destino. Placeholders
     # NATIVE são preservados no próprio Line Item com creativeTemplateId.
     optional_fields = [
+        # Deve referenciar CreativeTargeting.name do Line Item destino.
+        "targetingName",
         "manualCreativeRotationWeight",
         "sequentialCreativeRotationIndex",
         "destinationUrl",
@@ -1069,6 +969,9 @@ def copiar_configuracao(
     source_lica_count = len(source_licas)
     previous_target_lica_count = len(target_licas)
 
+    # Valida Creative Targeting completo antes de qualquer alteração.
+    validate_creative_targeting_references(target, source_licas)
+
     # Validação prévia: se houver incompatibilidade PIXEL/NATIVE, falha aqui
     # antes de qualquer update/release no Line Item destino.
     source_creatives, native_creative_ids = (
@@ -1250,65 +1153,103 @@ def _read_id(
 
 def main() -> int:
     """
-    Modos:
-      Lote por código no nome (recomendado):
-        --source-codes 54371,54391,54411
-        --target-codes 54660,54330,54310
+    Permite executar este arquivo diretamente.
 
-      Compatibilidade com IDs reais do GAM:
-        --source-id 123456789 --target-id 987654321
+    Exemplos:
+        python backend/gam_copy.py --source-id 123 --target-id 456
+
+    No GitHub Actions, também aceita:
+        GAM_SOURCE_LINE_ITEM_ID
+        GAM_TARGET_LINE_ITEM_ID
+
+    A saída final é impressa em JSON e também gravada no resumo
+    do GitHub Actions quando GITHUB_STEP_SUMMARY estiver disponível.
     """
     parser = argparse.ArgumentParser(
-        description="Copia configurações e LICAs entre Line Items do Google Ad Manager."
+        description=(
+            "Copia configurações operacionais e LICAs entre "
+            "Line Items existentes do Google Ad Manager."
+        )
     )
-    parser.add_argument("--source-codes", help="Códigos de 5 dígitos das origens, separados por vírgula.")
-    parser.add_argument("--target-codes", help="Códigos de 5 dígitos dos destinos, separados por vírgula.")
-    parser.add_argument("--source-id", dest="source_id", help="ID real do Line Item de origem.")
-    parser.add_argument("--target-id", dest="target_id", help="ID real do Line Item de destino.")
+    parser.add_argument(
+        "--source-id",
+        dest="source_id",
+        help="ID do Line Item de origem.",
+    )
+    parser.add_argument(
+        "--target-id",
+        dest="target_id",
+        help="ID do Line Item de destino.",
+    )
     args = parser.parse_args()
 
-    source_codes = args.source_codes or os.getenv("GAM_SOURCE_CODES")
-    target_codes = args.target_codes or os.getenv("GAM_TARGET_CODES")
-    source_id = _read_id(args.source_id, "GAM_SOURCE_LINE_ITEM_ID")
-    target_id = _read_id(args.target_id, "GAM_TARGET_LINE_ITEM_ID")
+    source_id = _read_id(
+        args.source_id,
+        "GAM_SOURCE_LINE_ITEM_ID",
+    )
+    target_id = _read_id(
+        args.target_id,
+        "GAM_TARGET_LINE_ITEM_ID",
+    )
+
+    if source_id is None or target_id is None:
+        parser.error(
+            "Informe --source-id e --target-id, ou defina "
+            "GAM_SOURCE_LINE_ITEM_ID e GAM_TARGET_LINE_ITEM_ID."
+        )
 
     try:
-        if source_codes or target_codes:
-            if not source_codes or not target_codes:
-                parser.error("Informe as duas listas: origens e destinos.")
-            result = copiar_lote_por_codigo(source_codes, target_codes)
-        else:
-            if source_id is None or target_id is None:
-                parser.error(
-                    "Informe as listas GAM_SOURCE_CODES/GAM_TARGET_CODES ou "
-                    "--source-id/--target-id."
-                )
-            result = copiar_configuracao(source_id=source_id, target_id=target_id)
+        result = copiar_configuracao(
+            source_id=source_id,
+            target_id=target_id,
+        )
 
-        output = json.dumps(result, ensure_ascii=False, indent=2, default=str)
+        output = json.dumps(
+            result,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
         print(output)
 
         summary_path = os.getenv("GITHUB_STEP_SUMMARY")
         if summary_path:
-            with open(summary_path, "a", encoding="utf-8") as summary_file:
-                summary_file.write("# GAM Line Item Copier\n\n")
-                if "results" in result:
-                    summary_file.write(f"## Lote concluído: {result['pair_count']} pares\n\n")
-                    for item in result["results"]:
-                        pair = item["pair"]
-                        summary_file.write(
-                            f"- **{pair['source_code']} -> {pair['target_code']}**: "
-                            f"{pair['source_name']} -> {pair['target_name']}\n"
-                        )
-                else:
-                    summary_file.write(
-                        f"- **Origem:** {result['source']['id']} - {result['source']['name']}\n"
-                        f"- **Destino:** {result['target']['id']} - {result['target']['name']}\n"
-                    )
+            source = result["source"]
+            target = result["target"]
+            copied_fields = ", ".join(result["copied_fields"])
+
+            summary = (
+                "# GAM Line Item Copier\n\n"
+                "## Resultado\n\n"
+                f"- **Rede:** {result['network_code']}\n"
+                f"- **Origem:** {source['id']} - {source['name']}\n"
+                f"- **Destino:** {target['id']} - {target['name']}\n"
+                f"- **LICAs na origem:** {source['lica_count']}\n"
+                f"- **LICAs anteriores no destino:** "
+                f"{target['previous_lica_count']}\n"
+                f"- **LICAs criadas no destino:** "
+                f"{target['created_lica_count']}\n"
+                f"- **LICAs finais no destino:** "
+                f"{target['final_lica_count']}\n"
+                f"- **Campos copiados:** {copied_fields}\n"
+            )
+
+            with open(
+                summary_path,
+                "a",
+                encoding="utf-8",
+            ) as summary_file:
+                summary_file.write(summary)
+
         return 0
+
     except Exception as error:
-        print(f"Erro ao copiar configurações e LICAs: {error}", file=sys.stderr)
+        print(
+            f"Erro ao copiar configurações e LICAs: {error}",
+            file=sys.stderr,
+        )
         return 1
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
