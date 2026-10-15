@@ -476,6 +476,38 @@ def get_creative(creative_service: Any, creative_id: int) -> Any:
     return results[0]
 
 
+def get_creative_template(creative_template_service: Any, template_id: int) -> Any:
+    """Busca um CreativeTemplate pelo ID."""
+    statement = (
+        ad_manager.StatementBuilder(version=API_VERSION)
+        .Where("id = :template_id")
+        .WithBindVariable("template_id", int(template_id))
+        .Limit(1)
+    )
+    response = creative_template_service.getCreativeTemplatesByStatement(
+        statement.ToStatement()
+    )
+    results = _get_results(response)
+    if not results:
+        raise LookupError(f"CreativeTemplate {template_id} não encontrado.")
+    return results[0]
+
+
+def _creative_is_native_by_template(
+    creative: Any,
+    creative_template_service: Any,
+) -> bool:
+    """Detecta Native pelo CreativeTemplate, que é a fonte correta da elegibilidade."""
+    template_id = _get_field(creative, "creativeTemplateId", None)
+    if template_id in (None, ""):
+        return False
+    template = get_creative_template(
+        creative_template_service,
+        int(template_id),
+    )
+    return bool(_get_field(template, "isNativeEligible", False))
+
+
 def _is_native_creative(creative: Any) -> bool:
     """True somente para TemplateCreative marcado como elegível a Native."""
     return bool(_get_field(creative, "isNativeEligible", False))
@@ -488,9 +520,10 @@ def _native_template_id(creative: Any) -> Optional[int]:
 
 def validate_source_creatives_against_placeholders(
     creative_service: Any,
+    creative_template_service: Any,
     source_licas: List[Any],
     copied_target: Any,
-) -> Dict[int, Any]:
+) -> tuple[Dict[int, Any], set[int]]:
     """
     Valida os creatives ANTES de alterar o destino.
 
@@ -508,6 +541,7 @@ def validate_source_creatives_against_placeholders(
     }
 
     creatives: Dict[int, Any] = {}
+    native_creative_ids: set[int] = set()
     errors: List[str] = []
 
     for index, lica in enumerate(source_licas):
@@ -515,7 +549,12 @@ def validate_source_creatives_against_placeholders(
         creative = get_creative(creative_service, creative_id)
         creatives[creative_id] = creative
 
-        if _is_native_creative(creative):
+        is_native = _creative_is_native_by_template(
+            creative,
+            creative_template_service,
+        )
+        if is_native:
+            native_creative_ids.add(creative_id)
             template_id = _native_template_id(creative)
             if template_id is None or template_id not in native_template_ids:
                 errors.append(
@@ -542,7 +581,7 @@ def validate_source_creatives_against_placeholders(
             + " | ".join(errors)
         )
 
-    return creatives
+    return creatives, native_creative_ids
 
 
 def build_target_lica(
@@ -550,6 +589,7 @@ def build_target_lica(
     target_id: int,
     target_line_item: Optional[Any] = None,
     creative: Optional[Any] = None,
+    is_native: bool = False,
 ) -> Dict[str, Any]:
     """
     Cria o payload de uma nova LICA para o destino.
@@ -576,7 +616,7 @@ def build_target_lica(
     # Para Native, não envia sizes na LICA. O formato Native é validado
     # pelo creativeTemplateId do Creative contra o placeholder NATIVE.
     # Para Pixel, envia somente sizes explicitamente compatíveis.
-    if target_line_item is not None and not (creative and _is_native_creative(creative)):
+    if target_line_item is not None and not is_native:
         compatible_sizes = _filter_lica_sizes_for_target(
             source_lica,
             target_line_item,
@@ -782,6 +822,11 @@ def copiar_configuracao(
         version=API_VERSION,
     )
 
+    creative_template_service = client.GetService(
+        "CreativeTemplateService",
+        version=API_VERSION,
+    )
+
     # --------------------------------------------------------
     # Buscar origem e destino
     # --------------------------------------------------------
@@ -874,10 +919,13 @@ def copiar_configuracao(
 
     # Validação prévia: se houver incompatibilidade PIXEL/NATIVE, falha aqui
     # antes de qualquer update/release no Line Item destino.
-    source_creatives = validate_source_creatives_against_placeholders(
-        creative_service,
-        source_licas,
-        target,
+    source_creatives, native_creative_ids = (
+        validate_source_creatives_against_placeholders(
+            creative_service,
+            creative_template_service,
+            source_licas,
+            target,
+        )
     )
 
     new_licas = [
@@ -886,6 +934,7 @@ def copiar_configuracao(
             target_id,
             target,
             source_creatives[int(_get_field(source_lica, "creativeId"))],
+            int(_get_field(source_lica, "creativeId")) in native_creative_ids,
         )
         for source_lica in source_licas
     ]
