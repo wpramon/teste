@@ -461,10 +461,95 @@ def _filter_lica_sizes_for_target(
     return filtered or None
 
 
+def get_creative(creative_service: Any, creative_id: int) -> Any:
+    """Busca um Creative pelo ID."""
+    statement = (
+        ad_manager.StatementBuilder(version=API_VERSION)
+        .Where("id = :creative_id")
+        .WithBindVariable("creative_id", int(creative_id))
+        .Limit(1)
+    )
+    response = creative_service.getCreativesByStatement(statement.ToStatement())
+    results = _get_results(response)
+    if not results:
+        raise LookupError(f"Creative {creative_id} não encontrado.")
+    return results[0]
+
+
+def _is_native_creative(creative: Any) -> bool:
+    """True somente para TemplateCreative marcado como elegível a Native."""
+    return bool(_get_field(creative, "isNativeEligible", False))
+
+
+def _native_template_id(creative: Any) -> Optional[int]:
+    value = _get_field(creative, "creativeTemplateId", None)
+    return int(value) if value not in (None, "") else None
+
+
+def validate_source_creatives_against_placeholders(
+    creative_service: Any,
+    source_licas: List[Any],
+    copied_target: Any,
+) -> Dict[int, Any]:
+    """
+    Valida os creatives ANTES de alterar o destino.
+
+    Pixel: o size do Creative precisa existir entre placeholders PIXEL.
+    Native: o Creative precisa ser native eligible e seu creativeTemplateId
+    precisa existir em um placeholder NATIVE copiado da origem.
+    """
+    placeholders = _get_field(copied_target, "creativePlaceholders", []) or []
+    pixel_sizes = _allowed_pixel_sizes(copied_target)
+    native_template_ids = {
+        int(_get_field(ph, "creativeTemplateId"))
+        for ph in placeholders
+        if _get_field(ph, "creativeSizeType", "PIXEL") == "NATIVE"
+        and _get_field(ph, "creativeTemplateId", None) not in (None, "")
+    }
+
+    creatives: Dict[int, Any] = {}
+    errors: List[str] = []
+
+    for index, lica in enumerate(source_licas):
+        creative_id = int(_get_field(lica, "creativeId"))
+        creative = get_creative(creative_service, creative_id)
+        creatives[creative_id] = creative
+
+        if _is_native_creative(creative):
+            template_id = _native_template_id(creative)
+            if template_id is None or template_id not in native_template_ids:
+                errors.append(
+                    f"LICA[{index}] Creative {creative_id}: Native template "
+                    f"{template_id} não existe nos creativePlaceholders NATIVE."
+                )
+            continue
+
+        size = _get_field(creative, "size", None)
+        signature = _size_signature(size)
+        if signature not in pixel_sizes:
+            if signature:
+                size_desc = f"{signature[0]}x{signature[1]}"
+            else:
+                size_desc = "desconhecido"
+            errors.append(
+                f"LICA[{index}] Creative {creative_id}: size {size_desc} não "
+                "existe nos creativePlaceholders PIXEL."
+            )
+
+    if errors:
+        raise ValueError(
+            "Validação de creatives falhou antes de alterar o destino: "
+            + " | ".join(errors)
+        )
+
+    return creatives
+
+
 def build_target_lica(
     source_lica: Any,
     target_id: int,
     target_line_item: Optional[Any] = None,
+    creative: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Cria o payload de uma nova LICA para o destino.
@@ -488,7 +573,10 @@ def build_target_lica(
         "creativeId": creative_id,
     }
 
-    if target_line_item is not None:
+    # Para Native, não envia sizes na LICA. O formato Native é validado
+    # pelo creativeTemplateId do Creative contra o placeholder NATIVE.
+    # Para Pixel, envia somente sizes explicitamente compatíveis.
+    if target_line_item is not None and not (creative and _is_native_creative(creative)):
         compatible_sizes = _filter_lica_sizes_for_target(
             source_lica,
             target_line_item,
@@ -689,6 +777,11 @@ def copiar_configuracao(
         version=API_VERSION,
     )
 
+    creative_service = client.GetService(
+        "CreativeService",
+        version=API_VERSION,
+    )
+
     # --------------------------------------------------------
     # Buscar origem e destino
     # --------------------------------------------------------
@@ -778,11 +871,21 @@ def copiar_configuracao(
     target_licas = original_target_licas
     source_lica_count = len(source_licas)
     previous_target_lica_count = len(target_licas)
+
+    # Validação prévia: se houver incompatibilidade PIXEL/NATIVE, falha aqui
+    # antes de qualquer update/release no Line Item destino.
+    source_creatives = validate_source_creatives_against_placeholders(
+        creative_service,
+        source_licas,
+        target,
+    )
+
     new_licas = [
         build_target_lica(
             source_lica,
             target_id,
             target,
+            source_creatives[int(_get_field(source_lica, "creativeId"))],
         )
         for source_lica in source_licas
     ]
