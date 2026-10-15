@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 import argparse
 import json
 import os
+import re
 import sys
 
 import google.auth
@@ -294,6 +295,45 @@ def _validate_line_item_id(
 
     return normalized_id
 
+
+def _parse_codes(raw: str, label: str) -> List[str]:
+    values = [v.strip() for v in re.split(r"[,;\n]+", raw or "") if v.strip()]
+    if not values: raise ValueError(f"{label} não pode ficar vazio.")
+    invalid = [v for v in values if not re.fullmatch(r"\d{5}", v)]
+    if invalid: raise ValueError(f"{label}: códigos inválidos: {', '.join(invalid)}")
+    return values
+
+def _name_contains_code(name: str, code: str) -> bool:
+    return re.search(rf"(?<!\d){re.escape(code)}(?!\d)", name or "") is not None
+
+def find_line_item_by_name_code(service: Any, code: str) -> Any:
+    sb=(ad_manager.StatementBuilder(version=API_VERSION).Where("name LIKE :p").WithBindVariable("p",f"%{code}%").Limit(500))
+    matches=[]
+    while True:
+        rows=_get_results(service.getLineItemsByStatement(sb.ToStatement()))
+        if not rows: break
+        matches.extend(x for x in rows if _name_contains_code(str(_get_field(x,"name","")),code))
+        sb.offset += sb.limit
+    if not matches: raise LookupError(f"Nenhum Line Item encontrado com o código {code} no nome.")
+    if len(matches)!=1: raise LookupError(f"O código {code} encontrou {len(matches)} Line Items; esperado 1.")
+    return matches[0]
+
+def resolve_batch_pairs(source_raw: str, target_raw: str) -> List[Dict[str, Any]]:
+    sources=_parse_codes(source_raw,"Origens"); targets=_parse_codes(target_raw,"Destinos")
+    if len(sources)!=len(targets): raise ValueError(f"Quantidades diferentes. Origens: {len(sources)}; destinos: {len(targets)}.")
+    client=get_client(); service=client.GetService("LineItemService",version=API_VERSION); pairs=[]
+    for a,b in zip(sources,targets):
+        src=find_line_item_by_name_code(service,a); dst=find_line_item_by_name_code(service,b)
+        sid=int(_get_field(src,"id")); tid=int(_get_field(dst,"id"))
+        pairs.append({"source_code":a,"target_code":b,"source_id":sid,"target_id":tid})
+    return pairs
+
+def copiar_lote_por_codigo(source_raw: str, target_raw: str) -> Dict[str, Any]:
+    pairs=resolve_batch_pairs(source_raw,target_raw); results=[]
+    for i,pair in enumerate(pairs,1):
+        print(f"[{i}/{len(pairs)}] {pair['source_code']} -> {pair['target_code']} | {pair['source_id']} -> {pair['target_id']}",flush=True)
+        results.append(copiar_configuracao(pair["source_id"],pair["target_id"]))
+    return {"message":"Lote concluído com sucesso.","pair_count":len(results),"results":results}
 
 def get_line_item(
     line_item_service: Any,
@@ -1152,104 +1192,22 @@ def _read_id(
 
 
 def main() -> int:
-    """
-    Permite executar este arquivo diretamente.
-
-    Exemplos:
-        python backend/gam_copy.py --source-id 123 --target-id 456
-
-    No GitHub Actions, também aceita:
-        GAM_SOURCE_LINE_ITEM_ID
-        GAM_TARGET_LINE_ITEM_ID
-
-    A saída final é impressa em JSON e também gravada no resumo
-    do GitHub Actions quando GITHUB_STEP_SUMMARY estiver disponível.
-    """
-    parser = argparse.ArgumentParser(
-        description=(
-            "Copia configurações operacionais e LICAs entre "
-            "Line Items existentes do Google Ad Manager."
-        )
-    )
-    parser.add_argument(
-        "--source-id",
-        dest="source_id",
-        help="ID do Line Item de origem.",
-    )
-    parser.add_argument(
-        "--target-id",
-        dest="target_id",
-        help="ID do Line Item de destino.",
-    )
-    args = parser.parse_args()
-
-    source_id = _read_id(
-        args.source_id,
-        "GAM_SOURCE_LINE_ITEM_ID",
-    )
-    target_id = _read_id(
-        args.target_id,
-        "GAM_TARGET_LINE_ITEM_ID",
-    )
-
-    if source_id is None or target_id is None:
-        parser.error(
-            "Informe --source-id e --target-id, ou defina "
-            "GAM_SOURCE_LINE_ITEM_ID e GAM_TARGET_LINE_ITEM_ID."
-        )
-
+    parser=argparse.ArgumentParser(description="Copia configurações e LICAs entre Line Items do Google Ad Manager.")
+    parser.add_argument("--source-codes"); parser.add_argument("--target-codes")
+    parser.add_argument("--source-id",dest="source_id"); parser.add_argument("--target-id",dest="target_id")
+    args=parser.parse_args()
+    sc=args.source_codes or os.getenv("GAM_SOURCE_CODES"); tc=args.target_codes or os.getenv("GAM_TARGET_CODES")
+    sid=_read_id(args.source_id,"GAM_SOURCE_LINE_ITEM_ID"); tid=_read_id(args.target_id,"GAM_TARGET_LINE_ITEM_ID")
     try:
-        result = copiar_configuracao(
-            source_id=source_id,
-            target_id=target_id,
-        )
-
-        output = json.dumps(
-            result,
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        )
-        print(output)
-
-        summary_path = os.getenv("GITHUB_STEP_SUMMARY")
-        if summary_path:
-            source = result["source"]
-            target = result["target"]
-            copied_fields = ", ".join(result["copied_fields"])
-
-            summary = (
-                "# GAM Line Item Copier\n\n"
-                "## Resultado\n\n"
-                f"- **Rede:** {result['network_code']}\n"
-                f"- **Origem:** {source['id']} - {source['name']}\n"
-                f"- **Destino:** {target['id']} - {target['name']}\n"
-                f"- **LICAs na origem:** {source['lica_count']}\n"
-                f"- **LICAs anteriores no destino:** "
-                f"{target['previous_lica_count']}\n"
-                f"- **LICAs criadas no destino:** "
-                f"{target['created_lica_count']}\n"
-                f"- **LICAs finais no destino:** "
-                f"{target['final_lica_count']}\n"
-                f"- **Campos copiados:** {copied_fields}\n"
-            )
-
-            with open(
-                summary_path,
-                "a",
-                encoding="utf-8",
-            ) as summary_file:
-                summary_file.write(summary)
-
-        return 0
-
+        if sc or tc:
+            if not sc or not tc: raise ValueError("Informe origens e destinos.")
+            result=copiar_lote_por_codigo(sc,tc)
+        else:
+            if sid is None or tid is None: raise ValueError("Informe GAM_SOURCE_CODES/GAM_TARGET_CODES ou os IDs reais.")
+            result=copiar_configuracao(sid,tid)
+        print(json.dumps(result,ensure_ascii=False,indent=2,default=str)); return 0
     except Exception as error:
-        print(
-            f"Erro ao copiar configurações e LICAs: {error}",
-            file=sys.stderr,
-        )
-        return 1
-
+        print(f"Erro ao copiar configurações e LICAs: {error}",file=sys.stderr); return 1
 
 if __name__ == "__main__":
     raise SystemExit(main())
