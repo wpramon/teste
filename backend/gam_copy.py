@@ -69,7 +69,7 @@ FIELDS_TO_COPY = [
     "deliveryRateType",
     "creativeRotationType",
     "roadblockingType",
-    "environmentType",
+    # environmentType é preservado e validado separadamente.
     "companionDeliveryOption",
 
     # Frequência
@@ -92,6 +92,7 @@ PRESERVED_FIELDS = [
     "name",
     "orderId",
     "status",
+    "environmentType",
 
     # Datas
     "startDateTime",
@@ -844,6 +845,26 @@ def _update_with_inventory_handling(
     return list(result or []), True
 
 
+def _environment_label(value: Any) -> str:
+    if value == "VIDEO_PLAYER":
+        return "VIDEO"
+    if value == "BROWSER":
+        return "DISPLAY"
+    return str(value or "DESCONHECIDO")
+
+
+def validate_environment_compatibility(source: Any, target: Any) -> None:
+    source_environment = _get_field(source, "environmentType", None)
+    target_environment = _get_field(target, "environmentType", None)
+    if source_environment != target_environment:
+        raise ValueError(
+            "Tipos de Line Item incompatíveis: "
+            f"origem={_environment_label(source_environment)}; "
+            f"destino={_environment_label(target_environment)}. "
+            "A cópia exige DISPLAY->DISPLAY ou VIDEO->VIDEO."
+        )
+
+
 # ============================================================
 # FUNÇÃO PRINCIPAL
 # ============================================================
@@ -943,6 +964,9 @@ def copiar_configuracao(
         "name",
         str(target_id),
     )
+
+    # Validação estrutural antes de qualquer alteração.
+    validate_environment_compatibility(source, target)
 
     # Snapshot completo do destino antes de qualquer alteração.
     original_target = deepcopy(target)
