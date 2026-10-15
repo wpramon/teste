@@ -61,6 +61,10 @@ FIELDS_TO_COPY = [
     # Tamanhos e configurações esperadas dos criativos
     "creativePlaceholders",
 
+    # Creative-level targeting. Os nomes são referenciados tanto pelos
+    # CreativePlaceholders quanto pelas LICAs.
+    "creativeTargetings",
+
     # Configurações de entrega
     "deliveryRateType",
     "creativeRotationType",
@@ -602,6 +606,42 @@ def validate_source_creatives_against_placeholders(
     return creatives, native_creative_ids
 
 
+def validate_creative_targeting_references(
+    line_item: Any,
+    licas: List[Any],
+) -> None:
+    """
+    Garante que cada targetingName usado em placeholder ou LICA possui
+    um CreativeTargeting com o mesmo name no Line Item que será enviado.
+    """
+    creative_targetings = _get_field(line_item, "creativeTargetings", []) or []
+    names = {
+        str(_get_field(item, "name"))
+        for item in creative_targetings
+        if _get_field(item, "name", None) not in (None, "")
+    }
+
+    referenced: set[str] = set()
+    placeholders = _get_field(line_item, "creativePlaceholders", []) or []
+    for placeholder in placeholders:
+        name = _get_field(placeholder, "targetingName", None)
+        if name not in (None, ""):
+            referenced.add(str(name))
+
+    for lica in licas:
+        name = _get_field(lica, "targetingName", None)
+        if name not in (None, ""):
+            referenced.add(str(name))
+
+    missing = sorted(referenced - names)
+    if missing:
+        raise ValueError(
+            "Creative Targeting inconsistente na origem. Os nomes "
+            f"{missing} são referenciados por Expected creatives/LICAs, "
+            "mas não existem em LineItem.creativeTargetings."
+        )
+
+
 def build_target_lica(
     source_lica: Any,
     target_id: int,
@@ -648,6 +688,9 @@ def build_target_lica(
     # existem nos creativePlaceholders PIXEL do destino. Placeholders
     # NATIVE são preservados no próprio Line Item com creativeTemplateId.
     optional_fields = [
+        # Obrigatório quando a associação usa creative-level targeting.
+        # Deve corresponder a CreativeTargeting.name do Line Item.
+        "targetingName",
         "manualCreativeRotationWeight",
         "sequentialCreativeRotationIndex",
         "destinationUrl",
@@ -796,6 +839,7 @@ def copiar_configuracao(
     Substitui no destino:
         - targeting
         - creativePlaceholders
+        - creativeTargetings e targetingName das LICAs
         - frequência
         - pacing e rotação
         - roadblocking
@@ -935,6 +979,13 @@ def copiar_configuracao(
     target_licas = original_target_licas
     source_lica_count = len(source_licas)
     previous_target_lica_count = len(target_licas)
+
+    # Valida o conjunto completo do creative-level targeting antes de alterar
+    # o destino: creativeTargetings + placeholder.targetingName + LICA.targetingName.
+    validate_creative_targeting_references(
+        target,
+        source_licas,
+    )
 
     # Validação prévia: se houver incompatibilidade PIXEL/NATIVE, falha aqui
     # antes de qualquer update/release no Line Item destino.
