@@ -409,9 +409,62 @@ def delete_target_licas(
     return int(num_changes or 0)
 
 
+def _size_signature(size: Any) -> Optional[tuple[int, int, bool]]:
+    """Normaliza um Size SOAP/dict para comparação."""
+    if not size:
+        return None
+    width = _get_field(size, "width", None)
+    height = _get_field(size, "height", None)
+    if width is None or height is None:
+        return None
+    is_aspect_ratio = bool(_get_field(size, "isAspectRatio", False))
+    return (int(width), int(height), is_aspect_ratio)
+
+
+def _allowed_pixel_sizes(line_item: Any) -> set[tuple[int, int, bool]]:
+    """Retorna apenas sizes dos placeholders PIXEL do Line Item."""
+    allowed: set[tuple[int, int, bool]] = set()
+    placeholders = _get_field(line_item, "creativePlaceholders", []) or []
+    for placeholder in placeholders:
+        creative_size_type = _get_field(
+            placeholder,
+            "creativeSizeType",
+            "PIXEL",
+        )
+        if creative_size_type != "PIXEL":
+            continue
+        signature = _size_signature(_get_field(placeholder, "size", None))
+        if signature:
+            allowed.add(signature)
+    return allowed
+
+
+def _filter_lica_sizes_for_target(
+    source_lica: Any,
+    target_line_item: Any,
+) -> Optional[List[Any]]:
+    """
+    Copia sizes da LICA somente quando forem sizes PIXEL permitidos pelos
+    creativePlaceholders do destino. Para Native, não força size na LICA:
+    o formato é definido pelo placeholder NATIVE + creativeTemplateId.
+    """
+    source_sizes = _get_field(source_lica, "sizes", None)
+    if not source_sizes:
+        return None
+
+    allowed = _allowed_pixel_sizes(target_line_item)
+    filtered: List[Any] = []
+    for size in source_sizes:
+        if _size_signature(size) in allowed:
+            filtered.append(deepcopy(size))
+
+    return filtered or None
+
+
 def build_target_lica(
     source_lica: Any,
     target_id: int,
+    target_line_item: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Cria o payload de uma nova LICA para o destino.
@@ -435,12 +488,19 @@ def build_target_lica(
         "creativeId": creative_id,
     }
 
-    # Datas e sizes da LICA de origem NÃO são copiados.
-    # - Sem startDateTime/endDateTime, a nova LICA herda a janela
-    #   temporal do Line Item de destino.
-    # - Sem sizes, o GAM valida a associação pelo tamanho real do
-    #   creative contra os creativePlaceholders já copiados para o destino.
-    # Isso preserva integralmente startDateTime/endDateTime do Line Item.
+    if target_line_item is not None:
+        compatible_sizes = _filter_lica_sizes_for_target(
+            source_lica,
+            target_line_item,
+        )
+        if compatible_sizes:
+            new_lica["sizes"] = compatible_sizes
+
+    # Datas da LICA de origem NÃO são copiadas.
+    # Sem startDateTime/endDateTime, a nova LICA usa a janela temporal
+    # do Line Item de destino. Sizes PIXEL são mantidos somente quando
+    # existem nos creativePlaceholders PIXEL do destino. Placeholders
+    # NATIVE são preservados no próprio Line Item com creativeTemplateId.
     optional_fields = [
         "manualCreativeRotationWeight",
         "sequentialCreativeRotationIndex",
@@ -719,7 +779,11 @@ def copiar_configuracao(
     source_lica_count = len(source_licas)
     previous_target_lica_count = len(target_licas)
     new_licas = [
-        build_target_lica(source_lica, target_id)
+        build_target_lica(
+            source_lica,
+            target_id,
+            target,
+        )
         for source_lica in source_licas
     ]
 
