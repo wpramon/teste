@@ -486,67 +486,77 @@ def create_licas_in_batches(
 
 
 # ============================================================
-# ATUALIZAÇÃO COM TRATAMENTO DE FORECAST
+# ATUALIZAÇÃO COM TRATAMENTO DE FORECAST / RESERVA
 # ============================================================
 
 def _is_not_enough_inventory_error(error: Exception) -> bool:
-    """Identifica ForecastingError.NOT_ENOUGH_INVENTORY retornado pelo GAM."""
-    text = str(error)
+    """Identifica o erro de forecast NOT_ENOUGH_INVENTORY."""
+    return "NOT_ENOUGH_INVENTORY" in str(error)
+
+
+def _line_item_statement(line_item_id: int) -> Dict[str, Any]:
+    """Monta o Statement usado pelas ações de reserva do Line Item."""
     return (
-        "ForecastingError.NOT_ENOUGH_INVENTORY" in text
-        or "ForecastError.NOT_ENOUGH_INVENTORY" in text
-        or "NOT_ENOUGH_INVENTORY" in text
+        ad_manager.StatementBuilder(version=API_VERSION)
+        .Where("id = :line_item_id")
+        .WithBindVariable("line_item_id", line_item_id)
+        .ToStatement()
     )
 
 
-def update_line_item_with_overbook_retry(
+def _reserve_and_overbook(
+    line_item_service: Any,
+    target_id: int,
+) -> None:
+    """Reserva o Line Item permitindo overbook e ignorando o inventory check."""
+    line_item_service.performLineItemAction(
+        {
+            "xsi_type": "ReserveAndOverbookLineItems",
+            "skipInventoryCheck": True,
+        },
+        _line_item_statement(target_id),
+    )
+
+
+def update_line_item_with_reservation_handling(
     line_item_service: Any,
     target: Any,
     target_id: int,
 ) -> tuple[List[Any], bool]:
     """
-    Atualiza o Line Item.
+    Atualiza normalmente. Se o GAM retornar NOT_ENOUGH_INVENTORY:
+      1. libera a reserva atual com ReleaseLineItems;
+      2. consulta novamente o destino;
+      3. reaplica somente FIELDS_TO_COPY;
+      4. atualiza o Line Item enquanto está liberado;
+      5. reserva novamente com ReserveAndOverbookLineItems.
 
-    Se o GAM bloquear updateLineItems por falta de inventário, executa
-    ReserveAndOverbookLineItems com skipInventoryCheck=True e tenta a
-    atualização novamente.
-
-    Retorna (itens_atualizados, overbook_retry_used).
+    Em caso de falha depois do release, tenta restaurar a reserva antes
+    de propagar o erro original.
     """
     try:
-        updated_items = line_item_service.updateLineItems([target])
-        return list(updated_items or []), False
+        updated = line_item_service.updateLineItems([target])
+        return list(updated or []), False
     except Exception as error:
         if not _is_not_enough_inventory_error(error):
             raise
 
         print(
-            "Aviso: o GAM retornou NOT_ENOUGH_INVENTORY. "
-            "Tentando reservar/overbookar o Line Item de destino "
-            "com skipInventoryCheck=True antes de repetir a atualização.",
+            "Aviso: NOT_ENOUGH_INVENTORY. Liberando a reserva do "
+            "Line Item destino antes da atualização.",
             file=sys.stderr,
         )
 
-        statement = (
-            ad_manager.StatementBuilder(version=API_VERSION)
-            .Where("id = :line_item_id")
-            .WithBindVariable("line_item_id", target_id)
-            .ToStatement()
-        )
+    statement = _line_item_statement(target_id)
+    released = False
 
-        action = {
-            "xsi_type": "ReserveAndOverbookLineItems",
-            "skipInventoryCheck": True,
-        }
-
+    try:
         line_item_service.performLineItemAction(
-            action,
+            {"xsi_type": "ReleaseLineItems"},
             statement,
         )
+        released = True
 
-        # Reconsulta o destino após a ação para trabalhar com o estado
-        # retornado pelo GAM e reaplica somente os campos que o chamador
-        # já colocou em target.
         refreshed_target = get_line_item(
             line_item_service,
             target_id,
@@ -560,10 +570,32 @@ def update_line_item_with_overbook_retry(
                     deepcopy(_get_field(target, field)),
                 )
 
-        updated_items = line_item_service.updateLineItems(
+        updated = line_item_service.updateLineItems(
             [refreshed_target]
         )
-        return list(updated_items or []), True
+
+        _reserve_and_overbook(
+            line_item_service,
+            target_id,
+        )
+        released = False
+
+        return list(updated or []), True
+
+    except Exception:
+        if released:
+            try:
+                _reserve_and_overbook(
+                    line_item_service,
+                    target_id,
+                )
+            except Exception as restore_error:
+                print(
+                    "ATENÇÃO: não foi possível restaurar automaticamente "
+                    f"a reserva do Line Item {target_id}: {restore_error}",
+                    file=sys.stderr,
+                )
+        raise
 
 
 # ============================================================
@@ -702,8 +734,8 @@ def copiar_configuracao(
     # Atualizar o Line Item destino
     # --------------------------------------------------------
 
-    updated_items, overbook_retry_used = (
-        update_line_item_with_overbook_retry(
+    updated_items, reservation_retry_used = (
+        update_line_item_with_reservation_handling(
             line_item_service,
             target,
             target_id,
@@ -812,7 +844,7 @@ def copiar_configuracao(
                 final_target_lica_count,
         },
         "copied_fields": copied_fields,
-        "overbook_retry_used": overbook_retry_used,
+        "reservation_retry_used": reservation_retry_used,
         "preserved_groups": [
             "Identificação",
             "Order",
@@ -921,8 +953,6 @@ def main() -> int:
                 f"- **LICAs finais no destino:** "
                 f"{target['final_lica_count']}\n"
                 f"- **Campos copiados:** {copied_fields}\n"
-                f"- **Retry com overbook:** "
-                f"{result['overbook_retry_used']}\n"
             )
 
             with open(
