@@ -1,53 +1,74 @@
-<!DOCTYPE html>
-
+<!doctype html>
 <html lang="pt-BR">
-
 <head>
-
-    <meta charset="UTF-8">
-
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
-    <title>GAM Copier</title>
-
-     <link rel="stylesheet" href="style.css">
-
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GAM Line Item Copier</title>
+  <link rel="stylesheet" href="style.css">
 </head>
-
 <body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <span class="eyebrow">Google Ad Manager</span>
+        <h1>Line Item Copier</h1>
+        <p>Renovação em lote por códigos de 5 dígitos.</p>
+      </div>
+      <span class="status" id="appStatus">Pronto</span>
+    </section>
 
-    <div class="container">
-
-        <h1>Google Ad Manager</h1>
-
-        <label for="source">
-            Line Item Origem
+    <section class="card">
+      <div class="grid">
+        <label class="field">
+          <span>Linhas de origem</span>
+          <small>Na ordem. Separe por vírgula, ponto e vírgula ou quebra de linha.</small>
+          <textarea id="sourceCodes" rows="6" placeholder="54371,54391,54411"></textarea>
         </label>
 
-        <input
-            id="source"
-            type="number"
-            placeholder="Digite o ID de origem">
-
-        <label for="target">
-            Line Item Destino
+        <label class="field">
+          <span>Linhas de destino</span>
+          <small>A ordem precisa corresponder às origens.</small>
+          <textarea id="targetCodes" rows="6" placeholder="54660,54330,54310"></textarea>
         </label>
+      </div>
 
-        <input
-            id="target"
-            type="number"
-            placeholder="Digite o ID de destino">
+      <div class="summary">
+        <div><strong id="sourceCount">0</strong><span>Origens</span></div>
+        <div><strong id="targetCount">0</strong><span>Destinos</span></div>
+        <div><strong id="pairCount">0</strong><span>Pares</span></div>
+      </div>
 
-        <button onclick="copyLineItem()">
-            Copiar Configuração
-        </button>
+      <div id="message" class="message" hidden></div>
 
-        <div id="msg"></div>
+      <section class="preview">
+        <div class="preview-head">
+          <h2>Pareamento</h2>
+          <span>Origem → Destino</span>
+        </div>
+        <div id="pairs" class="pairs empty">Preencha as listas para visualizar o pareamento.</div>
+      </section>
 
-    </div>
+      <div class="actions">
+        <button id="clearButton" class="button secondary" type="button">Limpar</button>
+        <button id="copyButton" class="button primary" type="button" disabled>Copiar Line Items</button>
+      </div>
+    </section>
 
-    <script src="app.js"></script>
+    <p class="footnote">A interface valida o lote antes do envio. A execução acontece no workflow protegido do GitHub Actions.</p>
+  </main>
 
+  <dialog id="confirmDialog">
+    <form method="dialog" class="dialog-card">
+      <h2>Confirmar cópia</h2>
+      <p>Confira a ordem antes de executar.</p>
+      <div id="confirmPairs" class="confirm-pairs"></div>
+      <div class="dialog-actions">
+        <button value="cancel" class="button secondary">Cancelar</button>
+        <button id="confirmButton" value="confirm" class="button primary">Confirmar cópia</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
 </body>
-
 </html>
