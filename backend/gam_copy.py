@@ -493,6 +493,79 @@ def create_licas_in_batches(
 
 
 # ============================================================
+# ALTERAÇÃO SEGURA / ROLLBACK
+# ============================================================
+
+def _is_not_enough_inventory_error(error: Exception) -> bool:
+    return "NOT_ENOUGH_INVENTORY" in str(error)
+
+
+def _statement_for_line_item(line_item_id: int) -> Dict[str, Any]:
+    return (
+        ad_manager.StatementBuilder(version=API_VERSION)
+        .Where("id = :line_item_id")
+        .WithBindVariable("line_item_id", line_item_id)
+        .ToStatement()
+    )
+
+
+def _reserve_with_overbook(line_item_service: Any, line_item_id: int) -> None:
+    line_item_service.performLineItemAction(
+        {
+            "xsi_type": "ReserveAndOverbookLineItems",
+            "skipInventoryCheck": True,
+        },
+        _statement_for_line_item(line_item_id),
+    )
+
+
+def _restore_licas(
+    lica_service: Any,
+    target_id: int,
+    original_licas: List[Any],
+) -> None:
+    current = get_licas(lica_service, target_id)
+    if current:
+        delete_target_licas(lica_service, target_id)
+
+    payloads = [
+        build_target_lica(lica, target_id)
+        for lica in original_licas
+    ]
+    if payloads:
+        create_licas_in_batches(lica_service, payloads)
+
+
+def _update_with_inventory_handling(
+    line_item_service: Any,
+    target: Any,
+    target_id: int,
+) -> tuple[List[Any], bool]:
+    """Atualiza; em NOT_ENOUGH_INVENTORY, libera, atualiza e reserva novamente."""
+    try:
+        result = line_item_service.updateLineItems([target])
+        return list(result or []), False
+    except Exception as error:
+        if not _is_not_enough_inventory_error(error):
+            raise
+
+    statement = _statement_for_line_item(target_id)
+    line_item_service.performLineItemAction(
+        {"xsi_type": "ReleaseLineItems"},
+        statement,
+    )
+
+    refreshed = get_line_item(line_item_service, target_id)
+    for field in FIELDS_TO_COPY:
+        if _has_field(target, field):
+            _set_field(refreshed, field, deepcopy(_get_field(target, field)))
+
+    result = line_item_service.updateLineItems([refreshed])
+    _reserve_with_overbook(line_item_service, target_id)
+    return list(result or []), True
+
+
+# ============================================================
 # FUNÇÃO PRINCIPAL
 # ============================================================
 
@@ -582,6 +655,14 @@ def copiar_configuracao(
         str(target_id),
     )
 
+    # Snapshot completo do destino antes de qualquer alteração.
+    original_target = deepcopy(target)
+    original_target_licas = get_licas(lica_service, target_id)
+    original_reservation_status = _get_field(
+        target, "reservationStatus", None
+    )
+
+
     # --------------------------------------------------------
     # Backup em memória dos campos que devem permanecer
     # --------------------------------------------------------
@@ -624,68 +705,104 @@ def copiar_configuracao(
             deepcopy(value),
         )
 
-    # --------------------------------------------------------------
-    # Atualizar o Line Item destino
+    # --------------------------------------------------------
+    # Atualizar destino e LICAs com rollback em caso de falha
     # --------------------------------------------------------
 
-    updated_items = (
-        line_item_service
-        .updateLineItems([target])
-    )
-
-    if not updated_items:
-        raise RuntimeError(
-            "O Google Ad Manager não retornou o Line Item "
-            "após a atualização."
-        )
-
-    # --------------------------------------------------------
-    # Consultar LICAs antes de modificar o destino
-    # --------------------------------------------------------
-
-    source_licas = get_licas(
-        lica_service,
-        source_id,
-    )
-
-    target_licas = get_licas(
-        lica_service,
-        target_id,
-    )
-
-    source_lica_count = len(source_licas)
-    previous_target_lica_count = len(target_licas)
-
-    # --------------------------------------------------------
-    # Preparar as LICAs antes de apagar as atuais
-    # --------------------------------------------------------
-
-    new_licas = [
-        build_target_lica(
-            source_lica,
-            target_id,
-        )
-        for source_lica in source_licas
-    ]
-
-    # --------------    # --------------------------------------------------------
-    # Substituir as LICAs no destino
-    # --------------------------------------------------------
-
+    reservation_retry_used = False
     deleted_lica_count = 0
     created_lica_count = 0
 
-    if target_licas:
-        deleted_lica_count = delete_target_licas(
-            lica_service,
+    # Lê e prepara todas as LICAs ANTES de alterar o destino.
+    source_licas = get_licas(lica_service, source_id)
+    target_licas = original_target_licas
+    source_lica_count = len(source_licas)
+    previous_target_lica_count = len(target_licas)
+    new_licas = [
+        build_target_lica(source_lica, target_id)
+        for source_lica in source_licas
+    ]
+
+    try:
+        updated_items, reservation_retry_used = _update_with_inventory_handling(
+            line_item_service,
+            target,
             target_id,
         )
 
-    if new_licas:
-        created_lica_count = create_licas_in_batches(
-            lica_service,
-            new_licas,
-        )
+        if not updated_items:
+            raise RuntimeError(
+                "O Google Ad Manager não retornou o Line Item após a atualização."
+            )
+
+        if target_licas:
+            deleted_lica_count = delete_target_licas(
+                lica_service,
+                target_id,
+            )
+
+        if new_licas:
+            created_lica_count = create_licas_in_batches(
+                lica_service,
+                new_licas,
+            )
+
+    except Exception as operation_error:
+        rollback_errors: List[str] = []
+
+        # 1. Tenta restaurar o Line Item original.
+        try:
+            try:
+                line_item_service.updateLineItems([deepcopy(original_target)])
+            except Exception as rollback_update_error:
+                if _is_not_enough_inventory_error(rollback_update_error):
+                    statement = _statement_for_line_item(target_id)
+                    try:
+                        line_item_service.performLineItemAction(
+                            {"xsi_type": "ReleaseLineItems"},
+                            statement,
+                        )
+                    except Exception:
+                        pass
+                    line_item_service.updateLineItems([deepcopy(original_target)])
+                else:
+                    raise
+        except Exception as rollback_error:
+            rollback_errors.append(
+                f"falha ao restaurar configurações do Line Item: {rollback_error}"
+            )
+
+        # 2. Restaura as LICAs originais.
+        try:
+            _restore_licas(
+                lica_service,
+                target_id,
+                original_target_licas,
+            )
+        except Exception as rollback_error:
+            rollback_errors.append(
+                f"falha ao restaurar LICAs: {rollback_error}"
+            )
+
+        # 3. Restaura a condição de reserva quando o destino era RESERVED.
+        if original_reservation_status == "RESERVED":
+            try:
+                _reserve_with_overbook(line_item_service, target_id)
+            except Exception as rollback_error:
+                rollback_errors.append(
+                    f"falha ao restaurar reserva: {rollback_error}"
+                )
+
+        if rollback_errors:
+            raise RuntimeError(
+                f"A cópia falhou: {operation_error}. "
+                "O rollback também encontrou problemas: "
+                + " | ".join(rollback_errors)
+            ) from operation_error
+
+        raise RuntimeError(
+            f"A cópia falhou e o destino foi restaurado: {operation_error}"
+        ) from operation_error
 
     # --------------------------------------------------------
     # Validar o resultado
@@ -735,6 +852,7 @@ def copiar_configuracao(
                 final_target_lica_count,
         },
         "copied_fields": copied_fields,
+        "reservation_retry_used": reservation_retry_used,
         "preserved_groups": [
             "Identificação",
             "Order",
