@@ -367,6 +367,31 @@ def get_licas(
     return licas
 
 
+def get_active_licas(
+    lica_service: Any,
+    line_item_id: int,
+) -> List[Any]:
+    """Busca somente associações LICA com status ACTIVE."""
+    statement_builder = (
+        ad_manager.StatementBuilder(version=API_VERSION)
+        .Where("lineItemId = :line_item_id AND status = :status")
+        .WithBindVariable("line_item_id", line_item_id)
+        .WithBindVariable("status", "ACTIVE")
+        .Limit(500)
+    )
+    licas: List[Any] = []
+    while True:
+        response = lica_service.getLineItemCreativeAssociationsByStatement(
+            statement_builder.ToStatement()
+        )
+        page_results = _get_results(response)
+        if not page_results:
+            break
+        licas.extend(page_results)
+        statement_builder.offset += statement_builder.limit
+    return licas
+
+
 def delete_target_licas(
     lica_service: Any,
     target_id: int,
@@ -524,13 +549,7 @@ def validate_source_creatives_against_placeholders(
     source_licas: List[Any],
     copied_target: Any,
 ) -> tuple[Dict[int, Any], set[int]]:
-    """
-    Valida os creatives ANTES de alterar o destino.
-
-    Pixel: o size do Creative precisa existir entre placeholders PIXEL.
-    Native: o Creative precisa ser native eligible e seu creativeTemplateId
-    precisa existir em um placeholder NATIVE copiado da origem.
-    """
+    """Valida LICAs ACTIVE contra os Expected creatives copiados da origem."""
     placeholders = _get_field(copied_target, "creativePlaceholders", []) or []
     pixel_sizes = _allowed_pixel_sizes(copied_target)
     native_template_ids = {
@@ -558,26 +577,25 @@ def validate_source_creatives_against_placeholders(
             template_id = _native_template_id(creative)
             if template_id is None or template_id not in native_template_ids:
                 errors.append(
-                    f"LICA[{index}] Creative {creative_id}: Native template "
-                    f"{template_id} não existe nos creativePlaceholders NATIVE."
+                    f"LICA ACTIVE [{index}] Creative {creative_id}: formato Native "
+                    f"(template {template_id}) não está em Expected creatives da origem."
                 )
             continue
 
-        size = _get_field(creative, "size", None)
-        signature = _size_signature(size)
+        signature = _size_signature(_get_field(creative, "size", None))
         if signature not in pixel_sizes:
-            if signature:
-                size_desc = f"{signature[0]}x{signature[1]}"
-            else:
-                size_desc = "desconhecido"
+            desc = (
+                f"{signature[0]}x{signature[1]}"
+                if signature else "desconhecido"
+            )
             errors.append(
-                f"LICA[{index}] Creative {creative_id}: size {size_desc} não "
-                "existe nos creativePlaceholders PIXEL."
+                f"LICA ACTIVE [{index}] Creative {creative_id}: size {desc} não "
+                "está em Expected creatives da origem."
             )
 
     if errors:
         raise ValueError(
-            "Validação de creatives falhou antes de alterar o destino: "
+            "Antes de copiar, ajuste Expected creatives na linha de origem: "
             + " | ".join(errors)
         )
 
@@ -782,7 +800,7 @@ def copiar_configuracao(
         - pacing e rotação
         - roadblocking
         - demais campos definidos em FIELDS_TO_COPY
-        - todas as LICAs
+        - LICAs ativas da origem, compartilhando os mesmos creativeIds
 
     Atenção:
         As LICAs atuais do destino são excluídas antes da criação
@@ -912,7 +930,8 @@ def copiar_configuracao(
     created_lica_count = 0
 
     # Lê e prepara todas as LICAs ANTES de alterar o destino.
-    source_licas = get_licas(lica_service, source_id)
+    # Compartilha somente os creatives com associação ACTIVE na origem.
+    source_licas = get_active_licas(lica_service, source_id)
     target_licas = original_target_licas
     source_lica_count = len(source_licas)
     previous_target_lica_count = len(target_licas)
