@@ -1,15 +1,16 @@
 name: GAM Line Item Copier
 
+run-name: "GAM Copier: ${{ inputs.source_codes }} -> ${{ inputs.target_codes }}"
+
 on:
   workflow_dispatch:
     inputs:
-      source_line_item_id:
-        description: "ID do Line Item de origem"
+      source_codes:
+        description: "Códigos das linhas de ORIGEM, na ordem (ex.: 54371,54391,54411)"
         required: true
         type: string
-
-      target_line_item_id:
-        description: "ID do Line Item de destino"
+      target_codes:
+        description: "Códigos das linhas de DESTINO, mesma ordem (ex.: 54660,54330,54310)"
         required: true
         type: string
 
@@ -18,17 +19,16 @@ permissions:
   id-token: write
 
 jobs:
-  copiar-line-item:
-    name: Copiar Line Item
+  copiar-line-items:
+    name: Copiar Line Items em lote
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Baixar repositorio
         uses: actions/checkout@v7
 
       - name: Configurar Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -43,10 +43,10 @@ jobs:
           workload_identity_provider: ${{ vars.WIF_PROVIDER }}
           service_account: gam-api-user-de-para@gam-lineitem-copier.iam.gserviceaccount.com
 
-      - name: Copiar configuracoes e LICAs
+      - name: Copiar configuracoes e LICAs em lote
         env:
           GAM_NETWORK_CODE: "32352161"
-          GAM_SOURCE_LINE_ITEM_ID: ${{ inputs.source_line_item_id }}
-          GAM_TARGET_LINE_ITEM_ID: ${{ inputs.target_line_item_id }}
+          GAM_SOURCE_CODES: ${{ inputs.source_codes }}
+          GAM_TARGET_CODES: ${{ inputs.target_codes }}
         run: |
           python backend/gam_copy.py
