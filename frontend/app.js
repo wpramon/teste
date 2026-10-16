@@ -220,8 +220,7 @@ async function waitForRun(runId) {
       {
         method: "GET",
         headers: {
-          "X-GAM-User": sessionUser,
-          "X-GAM-Key": sessionKey
+          "Authorization": `Bearer ${sessionToken}`
         }
       }
     );
