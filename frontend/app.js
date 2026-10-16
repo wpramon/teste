@@ -1,7 +1,7 @@
 const CONFIG = {
   // Não coloque PAT, senha ou qualquer credencial neste arquivo.
   // Configure aqui somente a URL HTTPS de uma camada autenticada que aceite POST.
-  endpoint: ""
+  endpoint: "https://gam-lineitem-copier.wagner-ramon.workers.dev"
 };
 
 const sourceCodes = document.querySelector("#sourceCodes");
@@ -83,13 +83,16 @@ dialog.addEventListener("close", async () => {
   setBusy(true);
   try {
     const response = await fetch(CONFIG.endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        source_codes: state.origins.join(","),
-        target_codes: state.destinations.join(",")
-      })
-    });
+  method: "POST",
+  credentials: "include",
+  headers: {
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    source_codes: state.origins.join(","),
+    target_codes: state.destinations.join(",")
+  })
+});
     if (!response.ok) throw new Error(`Falha no envio: HTTP ${response.status}`);
     const data = await response.json().catch(() => ({}));
     showMessage(data.message || "Solicitação enviada para execução.", "success");
