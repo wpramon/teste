@@ -1,6 +1,6 @@
 import os
 
-NETWORK_CODE = os.getenv("GAM_NETWORK_CODE", "32352161")
+NETWORK_CODE = os.getenv("GAM_NETWORK_CODE", "95377733")
 
 APPLICATION_NAME = os.getenv(
     "GAM_APPLICATION_NAME",
