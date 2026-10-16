@@ -34,10 +34,10 @@ function parseCodes(value) {
 function validate() {
   const origins = parseCodes(sourceCodes.value);
   const destinations = parseCodes(targetCodes.value);
-  const invalid = [...origins, ...destinations].filter(v => !/^\d{5}$/.test(v));
+  const invalid = [...origins, ...destinations].filter(v => !/^\d{5,6}$/.test(v));
   let error = "";
 
-  if (invalid.length) error = `Use somente códigos de 5 dígitos. Inválidos: ${[...new Set(invalid)].join(", ")}`;
+  if (invalid.length) error = `Use somente códigos de 5 a 6 dígitos. Inválidos: ${[...new Set(invalid)].join(", ")}`;
   else if (origins.length !== destinations.length && (origins.length || destinations.length)) error = `Quantidades diferentes: ${origins.length} origem(ns) e ${destinations.length} destino(s).`;
   else if (new Set(origins).size !== origins.length) error = "Existe código repetido na lista de origem.";
   else if (new Set(destinations).size !== destinations.length) error = "Existe código repetido na lista de destino.";
