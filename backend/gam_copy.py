@@ -300,7 +300,7 @@ def _validate_line_item_id(
 def _parse_codes(raw: str, label: str) -> List[str]:
     values = [v.strip() for v in re.split(r"[,;\n]+", raw or "") if v.strip()]
     if not values: raise ValueError(f"{label} não pode ficar vazio.")
-    invalid = [v for v in values if not re.fullmatch(r"\d{5}", v)]
+    invalid = [v for v in values if not re.fullmatch(r"\d{5,6}", v)]
     if invalid: raise ValueError(f"{label}: códigos inválidos: {', '.join(invalid)}")
     return values
 
