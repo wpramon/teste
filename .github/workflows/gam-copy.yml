@@ -45,7 +45,7 @@ jobs:
 
       - name: Copiar configuracoes e LICAs em lote
         env:
-          GAM_NETWORK_CODE: "32352161"
+          GAM_NETWORK_CODE: "95377733"
           GAM_SOURCE_CODES: ${{ inputs.source_codes }}
           GAM_TARGET_CODES: ${{ inputs.target_codes }}
         run: |
