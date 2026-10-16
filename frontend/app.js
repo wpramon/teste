@@ -128,6 +128,9 @@ dialog.addEventListener("close", async () => {
   if (!sessionUser || !sessionKey) return logout();
 
   setBusy(true);
+  showMessage("Execução iniciando...", "success");
+  appStatus.textContent = "Enviando…";
+
   try {
     const response = await fetch(CONFIG.endpoint, {
       method: "POST",
@@ -147,22 +150,81 @@ dialog.addEventListener("close", async () => {
     if (response.status === 401) {
       logout();
       showLoginMessage(data.error || "Usuário ou chave de acesso inválidos.");
-      throw new Error("Credencial inválida.");
+      return;
     }
 
-    if (!response.ok) throw new Error(data.error || `Falha no envio: HTTP ${response.status}`);
+    if (!response.ok) {
+      throw new Error(data.error || `Falha no envio: HTTP ${response.status}`);
+    }
 
-    showMessage(data.message || "Solicitação enviada para execução.", "success");
-    appStatus.textContent = "Enviado";
+    if (!data.run_id) {
+      throw new Error("A execução foi iniciada, mas o GitHub não retornou o Run ID para acompanhamento.");
+    }
+
+    appStatus.textContent = "Em execução";
+    showMessage("Configurações sendo copiadas. Aguardando conclusão do GitHub Actions...", "success");
+
+    const result = await waitForRun(data.run_id);
+
+    if (result.conclusion === "success") {
+      appStatus.textContent = "Concluído";
+      showMessage(
+        `✓ Cópia concluída com sucesso! ${state.origins.length} Line Item(s) processado(s).`,
+        "success"
+      );
+    } else {
+      appStatus.textContent = "Falhou";
+      throw new Error(`A execução terminou com status: ${result.conclusion || "falha"}.`);
+    }
   } catch (error) {
     if (sessionUser) {
-      showMessage(error.message || "Não foi possível iniciar a execução.", "error");
+      showMessage(error.message || "Não foi possível concluir a execução.", "error");
       appStatus.textContent = "Erro";
     }
   } finally {
-    if (sessionUser) setBusy(false);
+    setBusy(false);
   }
 });
+
+async function waitForRun(runId) {
+  const maxAttempts = 120;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const response = await fetch(
+      `${CONFIG.endpoint}/status?run_id=${encodeURIComponent(runId)}`,
+      {
+        method: "GET",
+        headers: {
+          "X-GAM-User": sessionUser,
+          "X-GAM-Key": sessionKey
+        }
+      }
+    );
+
+    const data = await response.json().catch(() => ({}));
+
+    if (response.status === 401) {
+      throw new Error("A autenticação expirou ou a chave de acesso não é mais válida.");
+    }
+
+    if (!response.ok) {
+      throw new Error(data.error || `Erro ao consultar execução: HTTP ${response.status}`);
+    }
+
+    if (data.status === "completed") {
+      return data;
+    }
+
+    appStatus.textContent = data.status === "queued" ? "Na fila" : "Em execução";
+    await sleep(2000);
+  }
+
+  throw new Error("A execução continua em andamento. Consulte o GitHub Actions para acompanhar.");
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function showMessage(text, type) {
   messageEl.hidden = false;
@@ -173,8 +235,26 @@ function showMessage(text, type) {
 function setBusy(busy) {
   copyButton.disabled = busy;
   clearButton.disabled = busy;
-  if (busy) appStatus.textContent = "Enviando…";
-  else validate();
+  sourceCodes.disabled = busy;
+  targetCodes.disabled = busy;
+
+  if (!busy) {
+    const state = validateStateOnly();
+    copyButton.disabled = Boolean(state.error) || !state.origins.length;
+  }
+}
+
+function validateStateOnly() {
+  const origins = parseCodes(sourceCodes.value);
+  const destinations = parseCodes(targetCodes.value);
+  const invalid = [...origins, ...destinations].filter(v => !/^\d{5}$/.test(v));
+  let error = "";
+  if (invalid.length) error = "invalid";
+  else if (origins.length !== destinations.length && (origins.length || destinations.length)) error = "count";
+  else if (new Set(origins).size !== origins.length) error = "source-duplicate";
+  else if (new Set(destinations).size !== destinations.length) error = "target-duplicate";
+  else if (origins.some((code, i) => code === destinations[i])) error = "same-pair";
+  return { origins, destinations, error };
 }
 
 validate();
