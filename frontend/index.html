@@ -14,17 +14,47 @@
         <h1>Line Item Copier</h1>
         <p>Renovação em lote por códigos de 5 dígitos.</p>
       </div>
-      <span class="status" id="appStatus">Pronto</span>
+      <div class="user-area">
+        <span class="status" id="appStatus">Bloqueado</span>
+        <button id="logoutButton" class="link-button" type="button" hidden>Sair</button>
+      </div>
     </section>
 
-    <section class="card">
+    <section id="loginCard" class="card login-card">
+      <div class="login-head">
+        <span class="lock">🔐</span>
+        <div>
+          <h2>Acesso à ferramenta</h2>
+          <p>Informe seu usuário e a chave individual de acesso.</p>
+        </div>
+      </div>
+      <form id="loginForm" class="login-form">
+        <label class="field">
+          <span>Usuário</span>
+          <input id="userName" autocomplete="username" placeholder="WAGNER" required>
+        </label>
+        <label class="field">
+          <span>Chave de acesso</span>
+          <input id="accessKey" type="password" autocomplete="current-password" placeholder="••••••••••••••••" required>
+        </label>
+        <div id="loginMessage" class="message" hidden></div>
+        <button class="button primary full" type="submit">Entrar</button>
+      </form>
+      <p class="security-note">A chave é mantida somente enquanto esta página permanecer aberta.</p>
+    </section>
+
+    <section id="copierCard" class="card" hidden>
+      <div class="signed-in">
+        <span>Usuário conectado</span>
+        <strong id="currentUser"></strong>
+      </div>
+
       <div class="grid">
         <label class="field">
           <span>Linhas de origem</span>
           <small>Na ordem. Separe por vírgula, ponto e vírgula ou quebra de linha.</small>
           <textarea id="sourceCodes" rows="6" placeholder="54371,54391,54411"></textarea>
         </label>
-
         <label class="field">
           <span>Linhas de destino</span>
           <small>A ordem precisa corresponder às origens.</small>
@@ -54,7 +84,7 @@
       </div>
     </section>
 
-    <p class="footnote">A interface valida o lote antes do envio. A execução acontece no workflow protegido do GitHub Actions.</p>
+    <p class="footnote">Execução protegida pelo Cloudflare Worker e GitHub App.</p>
   </main>
 
   <dialog id="confirmDialog">
@@ -64,11 +94,10 @@
       <div id="confirmPairs" class="confirm-pairs"></div>
       <div class="dialog-actions">
         <button value="cancel" class="button secondary">Cancelar</button>
-        <button id="confirmButton" value="confirm" class="button primary">Confirmar cópia</button>
+        <button value="confirm" class="button primary">Confirmar cópia</button>
       </div>
     </form>
   </dialog>
-
   <script src="app.js"></script>
 </body>
 </html>
