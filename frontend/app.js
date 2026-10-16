@@ -1,21 +1,31 @@
 const CONFIG = {
-  // Não coloque PAT, senha ou qualquer credencial neste arquivo.
-  // Configure aqui somente a URL HTTPS de uma camada autenticada que aceite POST.
   endpoint: "https://gam-lineitem-copier.wagner-ramon.workers.dev"
 };
 
-const sourceCodes = document.querySelector("#sourceCodes");
-const targetCodes = document.querySelector("#targetCodes");
-const copyButton = document.querySelector("#copyButton");
-const clearButton = document.querySelector("#clearButton");
-const pairsEl = document.querySelector("#pairs");
-const sourceCount = document.querySelector("#sourceCount");
-const targetCount = document.querySelector("#targetCount");
-const pairCount = document.querySelector("#pairCount");
-const messageEl = document.querySelector("#message");
-const dialog = document.querySelector("#confirmDialog");
-const confirmPairs = document.querySelector("#confirmPairs");
-const appStatus = document.querySelector("#appStatus");
+let sessionUser = "";
+let sessionKey = "";
+
+const $ = (s) => document.querySelector(s);
+const loginCard = $("#loginCard");
+const copierCard = $("#copierCard");
+const loginForm = $("#loginForm");
+const userName = $("#userName");
+const accessKey = $("#accessKey");
+const loginMessage = $("#loginMessage");
+const currentUser = $("#currentUser");
+const logoutButton = $("#logoutButton");
+const appStatus = $("#appStatus");
+const sourceCodes = $("#sourceCodes");
+const targetCodes = $("#targetCodes");
+const copyButton = $("#copyButton");
+const clearButton = $("#clearButton");
+const pairsEl = $("#pairs");
+const sourceCount = $("#sourceCount");
+const targetCount = $("#targetCount");
+const pairCount = $("#pairCount");
+const messageEl = $("#message");
+const dialog = $("#confirmDialog");
+const confirmPairs = $("#confirmPairs");
 
 function parseCodes(value) {
   return value.split(/[,;\n]+/).map(v => v.trim()).filter(Boolean);
@@ -52,13 +62,54 @@ function validate() {
   return { origins, destinations, error };
 }
 
+loginForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const user = userName.value.trim().toUpperCase();
+  const key = accessKey.value;
+  if (!user || !key) return showLoginMessage("Informe usuário e chave de acesso.");
+
+  // O segredo fica apenas em memória nesta aba. A validação real ocorre no POST do Worker.
+  sessionUser = user;
+  sessionKey = key;
+  accessKey.value = "";
+  loginMessage.hidden = true;
+  loginCard.hidden = true;
+  copierCard.hidden = false;
+  logoutButton.hidden = false;
+  currentUser.textContent = user;
+  appStatus.textContent = "Autenticado";
+  sourceCodes.focus();
+});
+
+logoutButton.addEventListener("click", logout);
+
+function logout() {
+  sessionUser = "";
+  sessionKey = "";
+  userName.value = "";
+  accessKey.value = "";
+  sourceCodes.value = "";
+  targetCodes.value = "";
+  copierCard.hidden = true;
+  loginCard.hidden = false;
+  logoutButton.hidden = true;
+  appStatus.textContent = "Bloqueado";
+  validate();
+  userName.focus();
+}
+
+function showLoginMessage(text) {
+  loginMessage.hidden = false;
+  loginMessage.className = "message error";
+  loginMessage.textContent = text;
+}
+
 [sourceCodes, targetCodes].forEach(el => el.addEventListener("input", validate));
 
 clearButton.addEventListener("click", () => {
   sourceCodes.value = "";
   targetCodes.value = "";
   messageEl.hidden = true;
-  appStatus.textContent = "Pronto";
   validate();
   sourceCodes.focus();
 });
@@ -74,34 +125,42 @@ dialog.addEventListener("close", async () => {
   if (dialog.returnValue !== "confirm") return;
   const state = validate();
   if (state.error) return;
-
-  if (!CONFIG.endpoint) {
-    showMessage("A interface está pronta, mas o endpoint autenticado ainda não foi configurado. Nenhuma credencial deve ser colocada no app.js.", "error");
-    return;
-  }
+  if (!sessionUser || !sessionKey) return logout();
 
   setBusy(true);
   try {
     const response = await fetch(CONFIG.endpoint, {
-  method: "POST",
-  credentials: "include",
-  headers: {
-    "Content-Type": "application/json"
-  },
-  body: JSON.stringify({
-    source_codes: state.origins.join(","),
-    target_codes: state.destinations.join(",")
-  })
-});
-    if (!response.ok) throw new Error(`Falha no envio: HTTP ${response.status}`);
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-GAM-User": sessionUser,
+        "X-GAM-Key": sessionKey
+      },
+      body: JSON.stringify({
+        source_codes: state.origins.join(","),
+        target_codes: state.destinations.join(",")
+      })
+    });
+
     const data = await response.json().catch(() => ({}));
+
+    if (response.status === 401) {
+      logout();
+      showLoginMessage(data.error || "Usuário ou chave de acesso inválidos.");
+      throw new Error("Credencial inválida.");
+    }
+
+    if (!response.ok) throw new Error(data.error || `Falha no envio: HTTP ${response.status}`);
+
     showMessage(data.message || "Solicitação enviada para execução.", "success");
     appStatus.textContent = "Enviado";
   } catch (error) {
-    showMessage(error.message || "Não foi possível iniciar a execução.", "error");
-    appStatus.textContent = "Erro";
+    if (sessionUser) {
+      showMessage(error.message || "Não foi possível iniciar a execução.", "error");
+      appStatus.textContent = "Erro";
+    }
   } finally {
-    setBusy(false);
+    if (sessionUser) setBusy(false);
   }
 });
 
@@ -114,7 +173,8 @@ function showMessage(text, type) {
 function setBusy(busy) {
   copyButton.disabled = busy;
   clearButton.disabled = busy;
-  appStatus.textContent = busy ? "Enviando…" : appStatus.textContent;
+  if (busy) appStatus.textContent = "Enviando…";
+  else validate();
 }
 
 validate();
