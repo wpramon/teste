@@ -2,8 +2,8 @@ const CONFIG = {
   endpoint: "https://gam-lineitem-copier.wagner-ramon.workers.dev"
 };
 
-let sessionUser = "";
-let sessionKey = "";
+let sessionUser = sessionStorage.getItem("gam_user") || "";
+let sessionToken = sessionStorage.getItem("gam_session_token") || "";
 
 const $ = (s) => document.querySelector(s);
 const loginCard = $("#loginCard");
@@ -62,30 +62,56 @@ function validate() {
   return { origins, destinations, error };
 }
 
-loginForm.addEventListener("submit", (event) => {
+loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const user = userName.value.trim().toUpperCase();
   const key = accessKey.value;
   if (!user || !key) return showLoginMessage("Informe usuário e chave de acesso.");
 
-  // O segredo fica apenas em memória nesta aba. A validação real ocorre no POST do Worker.
-  sessionUser = user;
-  sessionKey = key;
-  accessKey.value = "";
+  const button = loginForm.querySelector('button[type="submit"]');
+  button.disabled = true;
+  button.textContent = "Validando...";
   loginMessage.hidden = true;
-  loginCard.hidden = true;
-  copierCard.hidden = false;
-  logoutButton.hidden = false;
-  currentUser.textContent = user;
-  appStatus.textContent = "Autenticado";
-  sourceCodes.focus();
+
+  try {
+    const response = await fetch(`${CONFIG.endpoint}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user, key })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.token) throw new Error(data.error || "Não foi possível autenticar.");
+
+    sessionUser = data.user || user;
+    sessionToken = data.token;
+    sessionStorage.setItem("gam_user", sessionUser);
+    sessionStorage.setItem("gam_session_token", sessionToken);
+    accessKey.value = "";
+    showCopier();
+  } catch (error) {
+    showLoginMessage(error.message || "Não foi possível autenticar.");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Entrar";
+  }
 });
 
 logoutButton.addEventListener("click", logout);
 
+function showCopier() {
+  loginMessage.hidden = true;
+  loginCard.hidden = true;
+  copierCard.hidden = false;
+  logoutButton.hidden = false;
+  currentUser.textContent = sessionUser;
+  appStatus.textContent = "Autenticado";
+}
+
 function logout() {
   sessionUser = "";
-  sessionKey = "";
+  sessionToken = "";
+  sessionStorage.removeItem("gam_user");
+  sessionStorage.removeItem("gam_session_token");
   userName.value = "";
   accessKey.value = "";
   sourceCodes.value = "";
@@ -125,7 +151,7 @@ dialog.addEventListener("close", async () => {
   if (dialog.returnValue !== "confirm") return;
   const state = validate();
   if (state.error) return;
-  if (!sessionUser || !sessionKey) return logout();
+  if (!sessionUser || !sessionToken) return logout();
 
   setBusy(true);
   showMessage("Execução iniciando...", "success");
@@ -136,8 +162,7 @@ dialog.addEventListener("close", async () => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-GAM-User": sessionUser,
-        "X-GAM-Key": sessionKey
+        "Authorization": `Bearer ${sessionToken}`
       },
       body: JSON.stringify({
         source_codes: state.origins.join(","),
@@ -255,6 +280,10 @@ function validateStateOnly() {
   else if (new Set(destinations).size !== destinations.length) error = "target-duplicate";
   else if (origins.some((code, i) => code === destinations[i])) error = "same-pair";
   return { origins, destinations, error };
+}
+
+if (sessionUser && sessionToken) {
+  showCopier();
 }
 
 validate();
