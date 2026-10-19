@@ -307,34 +307,273 @@ def _parse_codes(raw: str, label: str) -> List[str]:
 def _name_contains_code(name: str, code: str) -> bool:
     return re.search(rf"(?<!\d){re.escape(code)}(?!\d)", name or "") is not None
 
-def find_line_item_by_name_code(service: Any, code: str) -> Any:
-    sb=(ad_manager.StatementBuilder(version=API_VERSION).Where("name LIKE :p").WithBindVariable("p",f"%{code}%").Limit(500))
-    matches=[]
+def find_line_item_candidates_by_name_code(service: Any, code: str) -> List[Any]:
+    """Retorna todos os Line Items cujo nome contém o código como token numérico."""
+    sb = (
+        ad_manager.StatementBuilder(version=API_VERSION)
+        .Where("name LIKE :p")
+        .WithBindVariable("p", f"%{code}%")
+        .Limit(500)
+    )
+    matches: List[Any] = []
     while True:
-        rows=_get_results(service.getLineItemsByStatement(sb.ToStatement()))
-        if not rows: break
-        matches.extend(x for x in rows if _name_contains_code(str(_get_field(x,"name","")),code))
+        rows = _get_results(service.getLineItemsByStatement(sb.ToStatement()))
+        if not rows:
+            break
+        matches.extend(
+            item
+            for item in rows
+            if _name_contains_code(str(_get_field(item, "name", "")), code)
+        )
         sb.offset += sb.limit
-    if not matches: raise LookupError(f"Nenhum Line Item encontrado com o código {code} no nome.")
-    if len(matches)!=1: raise LookupError(f"O código {code} encontrou {len(matches)} Line Items; esperado 1.")
-    return matches[0]
+    if not matches:
+        raise LookupError(
+            f"Nenhum Line Item encontrado com o código {code} no nome."
+        )
+    return matches
 
-def resolve_batch_pairs(source_raw: str, target_raw: str) -> List[Dict[str, Any]]:
-    sources=_parse_codes(source_raw,"Origens"); targets=_parse_codes(target_raw,"Destinos")
-    if len(sources)!=len(targets): raise ValueError(f"Quantidades diferentes. Origens: {len(sources)}; destinos: {len(targets)}.")
-    client=get_client(); service=client.GetService("LineItemService",version=API_VERSION); pairs=[]
-    for a,b in zip(sources,targets):
-        src=find_line_item_by_name_code(service,a); dst=find_line_item_by_name_code(service,b)
-        sid=int(_get_field(src,"id")); tid=int(_get_field(dst,"id"))
-        pairs.append({"source_code":a,"target_code":b,"source_id":sid,"target_id":tid})
-    return pairs
+
+def _source_candidate_is_preferred(item: Any) -> bool:
+    """Prioriza uma origem não arquivada e não explicitamente inativa."""
+    if bool(_get_field(item, "isArchived", False)):
+        return False
+    status = str(_get_field(item, "status", "") or "").upper()
+    return status not in {"INACTIVE", "ARCHIVED", "CANCELED"}
+
+
+def _get_orders_by_ids(
+    order_service: Any,
+    order_ids: set[int],
+    cache: Dict[int, Any],
+) -> None:
+    """Carrega Orders ausentes em lotes e os adiciona ao cache."""
+    missing = sorted(order_id for order_id in order_ids if order_id not in cache)
+    for start in range(0, len(missing), 500):
+        batch = missing[start:start + 500]
+        if not batch:
+            continue
+        statement = (
+            ad_manager.StatementBuilder(version=API_VERSION)
+            .Where("id IN (:order_ids)")
+            .WithBindVariable("order_ids", batch)
+            .Limit(500)
+        )
+        response = order_service.getOrdersByStatement(statement.ToStatement())
+        for order in _get_results(response):
+            cache[int(_get_field(order, "id"))] = order
+
+
+def _advertiser_id_for_line_item(item: Any, order_cache: Dict[int, Any]) -> int:
+    order_id = int(_get_field(item, "orderId"))
+    order = order_cache.get(order_id)
+    if order is None:
+        raise LookupError(f"Order {order_id} não encontrada para o Line Item.")
+    return int(_get_field(order, "advertiserId"))
+
+
+def _candidate_description(item: Any, order_cache: Dict[int, Any]) -> str:
+    advertiser_id = _advertiser_id_for_line_item(item, order_cache)
+    return (
+        f"id={_get_field(item, 'id')}, "
+        f"status={_get_field(item, 'status', 'desconhecido')}, "
+        f"advertiserId={advertiser_id}, "
+        f"nome={_get_field(item, 'name', '')}"
+    )
+
+
+def resolve_pair_by_code(
+    line_item_service: Any,
+    order_service: Any,
+    source_code: str,
+    target_code: str,
+    order_cache: Dict[int, Any],
+) -> Dict[str, Any]:
+    """
+    Resolve um par com segurança.
+
+    1. Busca todos os candidatos pelos códigos.
+    2. Na origem, prioriza candidatos não inativos/arquivados.
+    3. Mantém apenas combinações origem-destino do mesmo advertiser.
+    4. Exige uma única combinação final.
+    """
+    sources = find_line_item_candidates_by_name_code(
+        line_item_service, source_code
+    )
+    targets = find_line_item_candidates_by_name_code(
+        line_item_service, target_code
+    )
+
+    preferred_sources = [item for item in sources if _source_candidate_is_preferred(item)]
+    if preferred_sources:
+        sources = preferred_sources
+
+    order_ids = {
+        int(_get_field(item, "orderId"))
+        for item in [*sources, *targets]
+    }
+    _get_orders_by_ids(order_service, order_ids, order_cache)
+
+    compatible: List[tuple[Any, Any, int]] = []
+    for source in sources:
+        source_advertiser = _advertiser_id_for_line_item(source, order_cache)
+        for target in targets:
+            target_advertiser = _advertiser_id_for_line_item(target, order_cache)
+            if source_advertiser == target_advertiser:
+                compatible.append((source, target, source_advertiser))
+
+    if not compatible:
+        source_details = "; ".join(
+            _candidate_description(item, order_cache) for item in sources
+        )
+        target_details = "; ".join(
+            _candidate_description(item, order_cache) for item in targets
+        )
+        raise LookupError(
+            f"Nenhuma combinação do mesmo advertiser para {source_code} -> "
+            f"{target_code}. Origens: {source_details}. Destinos: {target_details}."
+        )
+
+    if len(compatible) != 1:
+        details = "; ".join(
+            f"origem({_candidate_description(source, order_cache)}) -> "
+            f"destino({_candidate_description(target, order_cache)})"
+            for source, target, _ in compatible
+        )
+        raise LookupError(
+            f"O par {source_code} -> {target_code} permaneceu ambíguo: "
+            f"{len(compatible)} combinações válidas. {details}"
+        )
+
+    source, target, advertiser_id = compatible[0]
+    source_id = int(_get_field(source, "id"))
+    target_id = int(_get_field(target, "id"))
+    if source_id == target_id:
+        raise ValueError(
+            f"O par {source_code} -> {target_code} resolveu para o mesmo "
+            f"Line Item {source_id}."
+        )
+    return {
+        "source_code": source_code,
+        "target_code": target_code,
+        "source_id": source_id,
+        "target_id": target_id,
+        "advertiser_id": advertiser_id,
+        "source_name": str(_get_field(source, "name", source_id)),
+        "target_name": str(_get_field(target, "name", target_id)),
+    }
+
+
+def _write_batch_summary(result: Dict[str, Any]) -> None:
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    with open(summary_path, "a", encoding="utf-8") as summary:
+        summary.write("\n## Resultado do processamento\n\n")
+        summary.write(f"- **Pares informados:** {result['pair_count']}\n")
+        summary.write(f"- **Executados com sucesso:** {result['success_count']}\n")
+        summary.write(f"- **Não executados:** {result['failure_count']}\n\n")
+        if result["successes"]:
+            summary.write("### Sucessos\n\n")
+            for item in result["successes"]:
+                pair = item["pair"]
+                summary.write(
+                    f"- ✅ `{pair['source_code']} -> {pair['target_code']}` "
+                    f"(advertiser `{pair['advertiser_id']}`)\n"
+                )
+        if result["failures"]:
+            summary.write("\n### Não executados\n\n")
+            for item in result["failures"]:
+                summary.write(
+                    f"- ❌ `{item['source_code']} -> {item['target_code']}`: "
+                    f"{item['error']}\n"
+                )
+
 
 def copiar_lote_por_codigo(source_raw: str, target_raw: str) -> Dict[str, Any]:
-    pairs=resolve_batch_pairs(source_raw,target_raw); results=[]
-    for i,pair in enumerate(pairs,1):
-        print(f"[{i}/{len(pairs)}] {pair['source_code']} -> {pair['target_code']} | {pair['source_id']} -> {pair['target_id']}",flush=True)
-        results.append(copiar_configuracao(pair["source_id"],pair["target_id"]))
-    return {"message":"Lote concluído com sucesso.","pair_count":len(results),"results":results}
+    """
+    Processa cada par de forma independente.
+
+    Uma falha de resolução ou cópia em um par não impede a execução dos
+    demais. Cada copiar_configuracao mantém seu rollback individual.
+    """
+    sources = _parse_codes(source_raw, "Origens")
+    targets = _parse_codes(target_raw, "Destinos")
+    if len(sources) != len(targets):
+        raise ValueError(
+            f"Quantidades diferentes. Origens: {len(sources)}; "
+            f"destinos: {len(targets)}."
+        )
+
+    client = get_client()
+    line_item_service = client.GetService(
+        "LineItemService", version=API_VERSION
+    )
+    order_service = client.GetService(
+        "OrderService", version=API_VERSION
+    )
+    order_cache: Dict[int, Any] = {}
+    successes: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+
+    for index, (source_code, target_code) in enumerate(
+        zip(sources, targets), start=1
+    ):
+        print(
+            f"[{index}/{len(sources)}] Resolvendo {source_code} -> "
+            f"{target_code}",
+            flush=True,
+        )
+        try:
+            pair = resolve_pair_by_code(
+                line_item_service,
+                order_service,
+                source_code,
+                target_code,
+                order_cache,
+            )
+            print(
+                f"[{index}/{len(sources)}] Executando "
+                f"{pair['source_id']} -> {pair['target_id']} "
+                f"(advertiser {pair['advertiser_id']})",
+                flush=True,
+            )
+            copy_result = copiar_configuracao(
+                pair["source_id"], pair["target_id"]
+            )
+            successes.append({"pair": pair, "result": copy_result})
+        except Exception as error:
+            failure = {
+                "source_code": source_code,
+                "target_code": target_code,
+                "error": str(error),
+            }
+            failures.append(failure)
+            print(
+                f"[{index}/{len(sources)}] NÃO EXECUTADO "
+                f"{source_code} -> {target_code}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    result = {
+        "message": (
+            "Lote concluído com sucesso."
+            if not failures
+            else "Lote concluído com ocorrências."
+        ),
+        "status": (
+            "success"
+            if not failures
+            else "partial_success" if successes else "failure"
+        ),
+        "pair_count": len(sources),
+        "success_count": len(successes),
+        "failure_count": len(failures),
+        "successes": successes,
+        "failures": failures,
+    }
+    _write_batch_summary(result)
+    return result
 
 def get_line_item(
     line_item_service: Any,
@@ -1226,6 +1465,9 @@ def main() -> int:
         if sc or tc:
             if not sc or not tc: raise ValueError("Informe origens e destinos.")
             result=copiar_lote_por_codigo(sc,tc)
+            if result.get("status") == "failure":
+                print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                return 1
         else:
             if sid is None or tid is None: raise ValueError("Informe GAM_SOURCE_CODES/GAM_TARGET_CODES ou os IDs reais.")
             result=copiar_configuracao(sid,tid)
