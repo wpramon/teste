@@ -18,6 +18,11 @@ on:
         required: false
         type: string
         default: "GITHUB"
+      allow_inverted:
+        description: "Confirmação explícita para origem posterior ao destino"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -47,6 +52,7 @@ jobs:
           REQUESTED_BY: ${{ inputs.requested_by }}
           SOURCE_CODES: ${{ inputs.source_codes }}
           TARGET_CODES: ${{ inputs.target_codes }}
+          ALLOW_INVERTED: ${{ inputs.allow_inverted }}
         run: |
           {
             echo "## Solicitação GAM Line Item Copier"
@@ -55,6 +61,7 @@ jobs:
             echo "- **Origens:** ${SOURCE_CODES}"
             echo "- **Destinos:** ${TARGET_CODES}"
             echo "- **Rede GAM:** 95377733"
+            echo "- **Inversão confirmada:** ${ALLOW_INVERTED}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Autenticar no Google Cloud
@@ -63,11 +70,21 @@ jobs:
           workload_identity_provider: ${{ vars.WIF_PROVIDER }}
           service_account: gam-api-user-de-para@gam-lineitem-copier.iam.gserviceaccount.com
 
+      - name: Bloquear possível inversão de origem e destino
+        env:
+          GAM_NETWORK_CODE: "95377733"
+          GAM_SOURCE_CODES: ${{ inputs.source_codes }}
+          GAM_TARGET_CODES: ${{ inputs.target_codes }}
+          GAM_ALLOW_INVERTED: ${{ inputs.allow_inverted }}
+        run: |
+          python backend/gam_copy.py --check-direction-only
+
       - name: Copiar configuracoes e LICAs em lote
         env:
           GAM_NETWORK_CODE: "95377733"
           GAM_SOURCE_CODES: ${{ inputs.source_codes }}
           GAM_TARGET_CODES: ${{ inputs.target_codes }}
           GAM_REQUESTED_BY: ${{ inputs.requested_by }}
+          GAM_ALLOW_INVERTED: ${{ inputs.allow_inverted }}
         run: |
           python backend/gam_copy.py
