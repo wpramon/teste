@@ -460,7 +460,119 @@ def resolve_pair_by_code(
         "advertiser_id": advertiser_id,
         "source_name": str(_get_field(source, "name", source_id)),
         "target_name": str(_get_field(target, "name", target_id)),
+        "source_item": source,
+        "target_item": target,
     }
+
+
+def _date_time_parts(value: Any) -> Optional[tuple[int, int, int, int, int, int]]:
+    """Normaliza DateTime SOAP/dict para comparação cronológica."""
+    if value is None:
+        return None
+    date = _get_field(value, "date", None)
+    if date is None:
+        return None
+    try:
+        return (
+            int(_get_field(date, "year")),
+            int(_get_field(date, "month")),
+            int(_get_field(date, "day")),
+            int(_get_field(value, "hour", 0) or 0),
+            int(_get_field(value, "minute", 0) or 0),
+            int(_get_field(value, "second", 0) or 0),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_date_time(value: Any) -> str:
+    parts = _date_time_parts(value)
+    if not parts:
+        return "data indisponível"
+    year, month, day, hour, minute, _ = parts
+    return f"{day:02d}/{month:02d}/{year:04d} {hour:02d}:{minute:02d}"
+
+
+def _pair_direction_warning(pair: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    source = pair.get("source_item")
+    target = pair.get("target_item")
+    source_start = _get_field(source, "startDateTime", None)
+    target_start = _get_field(target, "startDateTime", None)
+    source_key = _date_time_parts(source_start)
+    target_key = _date_time_parts(target_start)
+    if source_key and target_key and source_key > target_key:
+        return {
+            "source_code": pair["source_code"],
+            "target_code": pair["target_code"],
+            "source_name": pair["source_name"],
+            "target_name": pair["target_name"],
+            "source_start": _format_date_time(source_start),
+            "target_start": _format_date_time(target_start),
+        }
+    return None
+
+
+def check_batch_direction(
+    source_raw: str,
+    target_raw: str,
+    allow_inverted: bool = False,
+) -> Dict[str, Any]:
+    """Resolve todos os pares e bloqueia possível inversão antes da cópia."""
+    sources = _parse_codes(source_raw, "Origens")
+    targets = _parse_codes(target_raw, "Destinos")
+    if len(sources) != len(targets):
+        raise ValueError(
+            f"Quantidades diferentes. Origens: {len(sources)}; destinos: {len(targets)}."
+        )
+    client = get_client()
+    line_item_service = client.GetService("LineItemService", version=API_VERSION)
+    order_service = client.GetService("OrderService", version=API_VERSION)
+    order_cache: Dict[int, Any] = {}
+    warnings: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    for source_code, target_code in zip(sources, targets):
+        try:
+            pair = resolve_pair_by_code(
+                line_item_service,
+                order_service,
+                source_code,
+                target_code,
+                order_cache,
+            )
+            warning = _pair_direction_warning(pair)
+            if warning:
+                warnings.append(warning)
+        except Exception as error:
+            failures.append({
+                "source_code": source_code,
+                "target_code": target_code,
+                "error": str(error),
+            })
+    result = {
+        "ok": not failures and (allow_inverted or not warnings),
+        "requires_confirmation": bool(warnings) and not allow_inverted,
+        "warnings": warnings,
+        "failures": failures,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    if failures:
+        raise ValueError(
+            "A pré-validação encontrou pares que não puderam ser resolvidos: "
+            + " | ".join(
+                f"{item['source_code']} -> {item['target_code']}: {item['error']}"
+                for item in failures
+            )
+        )
+    if warnings and not allow_inverted:
+        details = " | ".join(
+            f"{item['source_code']} -> {item['target_code']}: origem "
+            f"{item['source_start']}; destino {item['target_start']}"
+            for item in warnings
+        )
+        raise RuntimeError(
+            "POSSIVEL_INVERSAO: a origem começa depois do destino. " + details
+        )
+    return result
 
 
 def _write_batch_summary(result: Dict[str, Any]) -> None:
@@ -489,7 +601,11 @@ def _write_batch_summary(result: Dict[str, Any]) -> None:
                 )
 
 
-def copiar_lote_por_codigo(source_raw: str, target_raw: str) -> Dict[str, Any]:
+def copiar_lote_por_codigo(
+    source_raw: str,
+    target_raw: str,
+    allow_inverted: bool = False,
+) -> Dict[str, Any]:
     """
     Processa cada par de forma independente.
 
@@ -531,6 +647,13 @@ def copiar_lote_por_codigo(source_raw: str, target_raw: str) -> Dict[str, Any]:
                 target_code,
                 order_cache,
             )
+            direction_warning = _pair_direction_warning(pair)
+            if direction_warning and not allow_inverted:
+                raise RuntimeError(
+                    "POSSIVEL_INVERSAO: a origem começa depois do destino. "
+                    f"Origem {direction_warning['source_start']}; "
+                    f"destino {direction_warning['target_start']}."
+                )
             print(
                 f"[{index}/{len(sources)}] Executando "
                 f"{pair['source_id']} -> {pair['target_id']} "
@@ -540,7 +663,8 @@ def copiar_lote_por_codigo(source_raw: str, target_raw: str) -> Dict[str, Any]:
             copy_result = copiar_configuracao(
                 pair["source_id"], pair["target_id"]
             )
-            successes.append({"pair": pair, "result": copy_result})
+            safe_pair = {k: v for k, v in pair.items() if k not in {"source_item", "target_item"}}
+            successes.append({"pair": safe_pair, "result": copy_result})
         except Exception as error:
             failure = {
                 "source_code": source_code,
@@ -1457,6 +1581,7 @@ def _read_id(
 def main() -> int:
     parser=argparse.ArgumentParser(description="Copia configurações e LICAs entre Line Items do Google Ad Manager.")
     parser.add_argument("--source-codes"); parser.add_argument("--target-codes")
+    parser.add_argument("--check-direction-only", action="store_true")
     parser.add_argument("--source-id",dest="source_id"); parser.add_argument("--target-id",dest="target_id")
     args=parser.parse_args()
     sc=args.source_codes or os.getenv("GAM_SOURCE_CODES"); tc=args.target_codes or os.getenv("GAM_TARGET_CODES")
@@ -1464,7 +1589,11 @@ def main() -> int:
     try:
         if sc or tc:
             if not sc or not tc: raise ValueError("Informe origens e destinos.")
-            result=copiar_lote_por_codigo(sc,tc)
+            allow_inverted = str(os.getenv("GAM_ALLOW_INVERTED", "false")).lower() == "true"
+            if args.check_direction_only:
+                check_batch_direction(sc, tc, allow_inverted=allow_inverted)
+                return 0
+            result=copiar_lote_por_codigo(sc,tc,allow_inverted=allow_inverted)
             if result.get("status") == "failure":
                 print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
                 return 1
