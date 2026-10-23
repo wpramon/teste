@@ -26,6 +26,11 @@ const pairCount = $("#pairCount");
 const messageEl = $("#message");
 const dialog = $("#confirmDialog");
 const confirmPairs = $("#confirmPairs");
+const inversionDialog = $("#inversionDialog");
+const inversionPairs = $("#inversionPairs");
+const inversionApproval = $("#inversionApproval");
+const confirmInversionButton = $("#confirmInversionButton");
+let pendingInversionState = null;
 
 function parseCodes(value) {
   return value.split(/[,;\n]+/).map(v => v.trim()).filter(Boolean);
@@ -151,12 +156,41 @@ dialog.addEventListener("close", async () => {
   if (dialog.returnValue !== "confirm") return;
   const state = validate();
   if (state.error) return;
+  await executeCopy(state, false);
+});
+
+inversionApproval.addEventListener("change", () => {
+  confirmInversionButton.disabled = !inversionApproval.checked;
+});
+
+inversionDialog.addEventListener("close", async () => {
+  if (inversionDialog.returnValue !== "confirm" || !inversionApproval.checked) {
+    pendingInversionState = null;
+    return;
+  }
+  const state = pendingInversionState;
+  pendingInversionState = null;
+  if (state) await executeCopy(state, true);
+});
+
+function showInversionWarning(state) {
+  pendingInversionState = state;
+  inversionApproval.checked = false;
+  confirmInversionButton.disabled = true;
+  inversionPairs.innerHTML = state.origins.map((code, i) =>
+    `<div class="pair"><b>${code}</b><span class="arrow">→</span><b>${state.destinations[i]}</b></div>`
+  ).join("");
+  inversionDialog.showModal();
+}
+
+async function executeCopy(state, allowInverted) {
   if (!sessionUser || !sessionToken) return logout();
-
   setBusy(true);
-  showMessage("Execução iniciando...", "success");
-  appStatus.textContent = "Enviando…";
-
+  showMessage(
+    allowInverted ? "Confirmação registrada. Reiniciando execução..." : "Validando datas e sentido da cópia...",
+    "success"
+  );
+  appStatus.textContent = allowInverted ? "Confirmando…" : "Validando…";
   try {
     const response = await fetch(CONFIG.endpoint, {
       method: "POST",
@@ -166,37 +200,38 @@ dialog.addEventListener("close", async () => {
       },
       body: JSON.stringify({
         source_codes: state.origins.join(","),
-        target_codes: state.destinations.join(",")
+        target_codes: state.destinations.join(","),
+        allow_inverted: allowInverted
       })
     });
-
     const data = await response.json().catch(() => ({}));
-
     if (response.status === 401) {
       logout();
       showLoginMessage(data.error || "Usuário ou chave de acesso inválidos.");
       return;
     }
-
-    if (!response.ok) {
-      throw new Error(data.error || `Falha no envio: HTTP ${response.status}`);
-    }
-
-    if (!data.run_id) {
-      throw new Error("A execução foi iniciada, mas o GitHub não retornou o Run ID para acompanhamento.");
-    }
+    if (!response.ok) throw new Error(data.error || `Falha no envio: HTTP ${response.status}`);
+    if (!data.run_id) throw new Error("A execução foi iniciada, mas o GitHub não retornou o Run ID para acompanhamento.");
 
     appStatus.textContent = "Em execução";
-    showMessage("Configurações sendo copiadas. Aguardando conclusão do GitHub Actions...", "success");
-
+    showMessage(
+      allowInverted
+        ? "Confirmação aceita. Configurações sendo copiadas..."
+        : "Pré-validação em andamento. Nenhuma linha será alterada antes dessa verificação.",
+      "success"
+    );
     const result = await waitForRun(data.run_id);
 
+    if (result.blocked_inversion && !allowInverted) {
+      appStatus.textContent = "Revisão necessária";
+      showMessage("Possível inversão detectada. Revise origem e destino antes de continuar.", "error");
+      setBusy(false);
+      showInversionWarning(state);
+      return;
+    }
     if (result.conclusion === "success") {
       appStatus.textContent = "Concluído";
-      showMessage(
-        `✓ Cópia concluída com sucesso! ${state.origins.length} Line Item(s) processado(s).`,
-        "success"
-      );
+      showMessage(`✓ Cópia concluída com sucesso! ${state.origins.length} Line Item(s) processado(s).`, "success");
     } else {
       appStatus.textContent = "Falhou";
       throw new Error(`A execução terminou com status: ${result.conclusion || "falha"}.`);
@@ -209,7 +244,7 @@ dialog.addEventListener("close", async () => {
   } finally {
     setBusy(false);
   }
-});
+}
 
 async function waitForRun(runId) {
   const maxAttempts = 120;
@@ -271,7 +306,7 @@ function setBusy(busy) {
 function validateStateOnly() {
   const origins = parseCodes(sourceCodes.value);
   const destinations = parseCodes(targetCodes.value);
-  const invalid = [...origins, ...destinations].filter(v => !/^\d{5}$/.test(v));
+  const invalid = [...origins, ...destinations].filter(v => !/^\d{5,6}$/.test(v));
   let error = "";
   if (invalid.length) error = "invalid";
   else if (origins.length !== destinations.length && (origins.length || destinations.length)) error = "count";
