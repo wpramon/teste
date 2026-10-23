@@ -12,7 +12,7 @@
       <div>
         <span class="eyebrow">Google Ad Manager</span>
         <h1>Line Item Copier</h1>
-        <p>Renovação em lote por códigos de 5 dígitos.</p>
+        <p>Renovação em lote por códigos de 5 ou 6 dígitos.</p>
       </div>
       <div class="user-area">
         <span class="status" id="appStatus">Bloqueado</span>
@@ -98,6 +98,23 @@
       </div>
     </form>
   </dialog>
+
+  <dialog id="inversionDialog">
+    <form method="dialog" class="dialog-card">
+      <h2>⚠ Possível inversão detectada</h2>
+      <p>A data de início de pelo menos uma origem é posterior à data do destino. Isso pode indicar que origem e destino foram informados ao contrário.</p>
+      <div id="inversionPairs" class="confirm-pairs"></div>
+      <label style="display:flex;gap:10px;align-items:flex-start;margin-top:18px;line-height:1.45">
+        <input id="inversionApproval" type="checkbox" style="margin-top:4px">
+        <span>Revisei os pares destacados e confirmo que desejo continuar mesmo assim.</span>
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel" class="button secondary">Cancelar</button>
+        <button id="confirmInversionButton" value="confirm" class="button primary" disabled>Continuar mesmo assim</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="app.js"></script>
 </body>
 </html>
