@@ -1259,10 +1259,10 @@ def normalize_video_request_platform_targeting(source: Any, target: Any, fallbac
     elif target_value is not None:
         chosen, chosen_from = target_value, "destino"
     else:
-        raise ValueError(
-            "Line Items de vídeo retornaram requestPlatformTargeting NULL tanto na origem "
-            "quanto no destino. A atualização foi bloqueada antes do updateLineItems."
-        )
+        # A SOAP API pode omitir este objeto mesmo em Line Items de vídeo válidos.
+        # Enviamos o objeto explicitamente com lista vazia, em vez de NULL.
+        chosen = {"targetedRequestPlatforms": []}
+        chosen_from = "fallback explícito (todas as plataformas)"
     _set_request_platform_targeting(target, chosen)
     print(
         "RequestPlatformTargeting VIDEO: "
