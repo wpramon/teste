@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import time
 
 import google.auth
 from google.auth.transport.requests import Request
@@ -69,6 +70,10 @@ FIELDS_TO_COPY = [
     "deliveryRateType",
     "creativeRotationType",
     "roadblockingType",
+
+    # Vídeo: mantém a compatibilidade entre o Line Item e os creatives.
+    "skippableAdType",
+
     # environmentType é preservado e validado separadamente.
     "companionDeliveryOption",
 
@@ -1123,11 +1128,9 @@ def create_licas_in_batches(
             start:start + batch_size
         ]
 
-        created = (
-            lica_service
-            .createLineItemCreativeAssociations(
-                batch
-            )
+        created = _call_with_concurrent_retry(
+            lambda: lica_service.createLineItemCreativeAssociations(batch),
+            "Criação das LICAs",
         )
 
         total_created += len(created or [])
@@ -1141,6 +1144,28 @@ def create_licas_in_batches(
 
 def _is_not_enough_inventory_error(error: Exception) -> bool:
     return "NOT_ENOUGH_INVENTORY" in str(error)
+
+
+def _is_concurrent_modification_error(error: Exception) -> bool:
+    return "CONCURRENT_MODIFICATION" in str(error)
+
+
+def _call_with_concurrent_retry(operation: Any, description: str) -> Any:
+    """Repete apenas falhas transitórias CONCURRENT_MODIFICATION."""
+    delays = (2, 4, 8)
+    for attempt in range(len(delays) + 1):
+        try:
+            return operation()
+        except Exception as error:
+            if not _is_concurrent_modification_error(error) or attempt >= len(delays):
+                raise
+            delay = delays[attempt]
+            print(
+                f"{description}: CONCURRENT_MODIFICATION; "
+                f"nova tentativa em {delay}s ({attempt + 2}/{len(delays) + 1}).",
+                flush=True,
+            )
+            time.sleep(delay)
 
 
 def _statement_for_line_item(line_item_id: int) -> Dict[str, Any]:
@@ -1186,7 +1211,10 @@ def _update_with_inventory_handling(
 ) -> tuple[List[Any], bool]:
     """Atualiza; em NOT_ENOUGH_INVENTORY, libera, atualiza e reserva novamente."""
     try:
-        result = line_item_service.updateLineItems([target])
+        result = _call_with_concurrent_retry(
+            lambda: line_item_service.updateLineItems([target]),
+            "Atualização do Line Item",
+        )
         return list(result or []), False
     except Exception as error:
         if not _is_not_enough_inventory_error(error):
@@ -1204,7 +1232,10 @@ def _update_with_inventory_handling(
             _set_field(refreshed, field, deepcopy(_get_field(target, field)))
 
     normalize_video_request_platform_targeting(target, refreshed, fallback=refreshed)
-    result = line_item_service.updateLineItems([refreshed])
+    result = _call_with_concurrent_retry(
+        lambda: line_item_service.updateLineItems([refreshed]),
+        "Atualização do Line Item após liberação de inventário",
+    )
     _reserve_with_overbook(line_item_service, target_id)
     return list(result or []), True
 
@@ -1442,6 +1473,14 @@ def copiar_configuracao(
     # Valida Creative Targeting completo antes de qualquer alteração.
     validate_creative_targeting_references(target, source_licas)
     normalize_video_request_platform_targeting(source, target, fallback=original_target)
+    if _get_field(target, "environmentType", None) == "VIDEO_PLAYER":
+        print(
+            "Skippability VIDEO: "
+            f"origem={_get_field(source, 'skippableAdType', None)}; "
+            f"destino_preparado={_get_field(target, 'skippableAdType', None)}",
+            flush=True,
+        )
+
 
     # Validação prévia: se houver incompatibilidade PIXEL/NATIVE, falha aqui
     # antes de qualquer update/release no Line Item destino.
@@ -1499,7 +1538,10 @@ def copiar_configuracao(
             normalize_video_request_platform_targeting(
                 original_target, rollback_target, fallback=rollback_fallback
             )
-            line_item_service.updateLineItems([rollback_target])
+            _call_with_concurrent_retry(
+                lambda: line_item_service.updateLineItems([rollback_target]),
+                "Rollback do Line Item",
+            )
 
         try:
             try:
