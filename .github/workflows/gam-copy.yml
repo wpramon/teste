@@ -1,5 +1,4 @@
 name: GAM Line Item Copier
-
 run-name: "GAM Copier | ${{ inputs.requested_by }} | ${{ inputs.source_codes }} -> ${{ inputs.target_codes }}"
 
 on:
@@ -27,6 +26,7 @@ on:
 permissions:
   contents: read
   id-token: write
+  actions: read
 
 jobs:
   copiar-line-items:
@@ -86,5 +86,15 @@ jobs:
           GAM_TARGET_CODES: ${{ inputs.target_codes }}
           GAM_REQUESTED_BY: ${{ inputs.requested_by }}
           GAM_ALLOW_INVERTED: ${{ inputs.allow_inverted }}
+          GAM_RESULT_FILE: gam-copy-result.json
         run: |
           python backend/gam_copy.py
+
+      - name: Publicar resultado para a interface
+        if: ${{ always() && hashFiles('gam-copy-result.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gam-copy-result-${{ github.run_id }}
+          path: gam-copy-result.json
+          retention-days: 7
+          if-no-files-found: ignore
