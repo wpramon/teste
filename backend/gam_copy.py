@@ -91,6 +91,11 @@ FIELDS_TO_COPY = [
 # Campos explicitamente preservados no destino.
 #
 # Esta lista também serve para documentação e validação.
+GAM_LINE_ITEM_URL_BASE = (
+    f"https://admanager.google.com/{NETWORK_CODE}"
+    "#delivery/line_item/detail/line_item_id="
+)
+
 PRESERVED_FIELDS = [
     # Identificação
     "id",
@@ -639,6 +644,7 @@ def copiar_lote_por_codigo(
     for index, (source_code, target_code) in enumerate(
         zip(sources, targets), start=1
     ):
+        pair: Optional[Dict[str, Any]] = None
         print(
             f"[{index}/{len(sources)}] Resolvendo {source_code} -> "
             f"{target_code}",
@@ -669,6 +675,8 @@ def copiar_lote_por_codigo(
                 pair["source_id"], pair["target_id"]
             )
             safe_pair = {k: v for k, v in pair.items() if k not in {"source_item", "target_item"}}
+            safe_pair["source_url"] = f"{GAM_LINE_ITEM_URL_BASE}{safe_pair['source_id']}"
+            safe_pair["target_url"] = f"{GAM_LINE_ITEM_URL_BASE}{safe_pair['target_id']}"
             successes.append({"pair": safe_pair, "result": copy_result})
         except Exception as error:
             failure = {
@@ -676,6 +684,13 @@ def copiar_lote_por_codigo(
                 "target_code": target_code,
                 "error": str(error),
             }
+            if 'pair' in locals() and isinstance(pair, dict):
+                if pair.get("source_id"):
+                    failure["source_id"] = pair["source_id"]
+                    failure["source_url"] = f"{GAM_LINE_ITEM_URL_BASE}{pair['source_id']}"
+                if pair.get("target_id"):
+                    failure["target_id"] = pair["target_id"]
+                    failure["target_url"] = f"{GAM_LINE_ITEM_URL_BASE}{pair['target_id']}"
             failures.append(failure)
             print(
                 f"[{index}/{len(sources)}] NÃO EXECUTADO "
@@ -1657,6 +1672,41 @@ def copiar_configuracao(
         ],
     }
 
+def _write_result_file(result: Dict[str, Any]) -> None:
+    """Grava um resultado enxuto para o frontend, sem detalhes técnicos internos."""
+    output_path = os.getenv("GAM_RESULT_FILE", "gam-copy-result.json")
+    public_result = {
+        "status": result.get("status"),
+        "pair_count": result.get("pair_count", 0),
+        "success_count": result.get("success_count", 0),
+        "failure_count": result.get("failure_count", 0),
+        "successes": [
+            {
+                "source_code": item.get("pair", {}).get("source_code"),
+                "target_code": item.get("pair", {}).get("target_code"),
+                "source_id": item.get("pair", {}).get("source_id"),
+                "target_id": item.get("pair", {}).get("target_id"),
+                "source_url": item.get("pair", {}).get("source_url"),
+                "target_url": item.get("pair", {}).get("target_url"),
+            }
+            for item in result.get("successes", [])
+        ],
+        "failures": [
+            {
+                "source_code": item.get("source_code"),
+                "target_code": item.get("target_code"),
+                "source_id": item.get("source_id"),
+                "target_id": item.get("target_id"),
+                "source_url": item.get("source_url"),
+                "target_url": item.get("target_url"),
+            }
+            for item in result.get("failures", [])
+        ],
+    }
+    with open(output_path, "w", encoding="utf-8") as output:
+        json.dump(public_result, output, ensure_ascii=False, indent=2)
+
+
 # ============================================================
 # EXECUÇÃO DIRETA E GITHUB ACTIONS
 # ============================================================
@@ -1688,6 +1738,7 @@ def main() -> int:
                 check_batch_direction(sc, tc, allow_inverted=allow_inverted)
                 return 0
             result=copiar_lote_por_codigo(sc,tc,allow_inverted=allow_inverted)
+            _write_result_file(result)
             if result.get("status") == "failure":
                 print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
                 return 1
