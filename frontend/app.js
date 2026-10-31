@@ -44,7 +44,6 @@ function validate() {
 
   if (invalid.length) error = `Use somente códigos de 5 a 6 dígitos. Inválidos: ${[...new Set(invalid)].join(", ")}`;
   else if (origins.length !== destinations.length && (origins.length || destinations.length)) error = `Quantidades diferentes: ${origins.length} origem(ns) e ${destinations.length} destino(s).`;
-  else if (new Set(origins).size !== origins.length) error = "Existe código repetido na lista de origem.";
   else if (new Set(destinations).size !== destinations.length) error = "Existe código repetido na lista de destino.";
   else if (origins.some((code, i) => code === destinations[i])) error = "Há um par com o mesmo código na origem e no destino.";
 
@@ -229,9 +228,9 @@ async function executeCopy(state, allowInverted) {
       showInversionWarning(state);
       return;
     }
-    if (result.conclusion === "success") {
-      appStatus.textContent = "Concluído";
-      showMessage(`✓ Cópia concluída com sucesso! ${state.origins.length} Line Item(s) processado(s).`, "success");
+    if (result.conclusion === "success" || result.batch_result) {
+      appStatus.textContent = result.batch_result?.failure_count ? "Concluído com atenção" : "Concluído";
+      renderBatchResult(result.batch_result, state);
     } else {
       appStatus.textContent = "Falhou";
       throw new Error(`A execução terminou com status: ${result.conclusion || "falha"}.`);
@@ -244,6 +243,51 @@ async function executeCopy(state, allowInverted) {
   } finally {
     setBusy(false);
   }
+}
+
+function renderBatchResult(batchResult, state) {
+  if (!batchResult) {
+    showMessage("A execução terminou, mas o detalhamento por linha não ficou disponível.", "error");
+    return;
+  }
+  const successes = batchResult.successes || [];
+  const failures = batchResult.failures || [];
+  const rows = [
+    ...successes.map(item => resultRow(item, true)),
+    ...failures.map(item => resultRow(item, false))
+  ].join("");
+  messageEl.hidden = false;
+  messageEl.className = "message batch-result";
+  messageEl.innerHTML = `
+    <div class="batch-result-head">
+      <strong>Resultado da cópia</strong>
+      <span>${successes.length} executada(s) · ${failures.length} para verificar</span>
+    </div>
+    <div class="batch-result-list">${rows}</div>
+  `;
+}
+
+function resultRow(item, success) {
+  const label = success ? "Executada" : "Verificar";
+  const icon = success ? "✓" : "✕";
+  const target = escapeHtml(item.target_code || "Destino");
+  const source = escapeHtml(item.source_code || "Origem");
+  const targetDisplay = item.target_url
+    ? `<a href="${escapeAttribute(item.target_url)}" target="_blank" rel="noopener noreferrer">${target} ↗</a>`
+    : `<span>${target}</span>`;
+  return `<div class="result-row ${success ? "result-success" : "result-failure"}">
+    <span class="result-icon">${icon}</span>
+    <span class="result-pair"><b>${source}</b><span>→</span>${targetDisplay}</span>
+    <span class="result-label">${label}</span>
+  </div>`;
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"})[char]);
+}
+
+function escapeAttribute(value) {
+  return escapeHtml(value);
 }
 
 async function waitForRun(runId) {
@@ -310,7 +354,6 @@ function validateStateOnly() {
   let error = "";
   if (invalid.length) error = "invalid";
   else if (origins.length !== destinations.length && (origins.length || destinations.length)) error = "count";
-  else if (new Set(origins).size !== origins.length) error = "source-duplicate";
   else if (new Set(destinations).size !== destinations.length) error = "target-duplicate";
   else if (origins.some((code, i) => code === destinations[i])) error = "same-pair";
   return { origins, destinations, error };
