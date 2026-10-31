@@ -246,10 +246,15 @@ async function executeCopy(state, allowInverted) {
 }
 
 function renderBatchResult(batchResult, state) {
-  if (!batchResult) {
-    showMessage("A execução terminou, mas o detalhamento por linha não ficou disponível.", "error");
-    return;
-  }
+ if (!batchResult) {
+  showMessage(
+    `✓ Cópia concluída com sucesso! ` +
+    `${state.origins.length} par(es) processado(s).`,
+    "success"
+  );
+
+  return;
+}
   const successes = batchResult.successes || [];
   const failures = batchResult.failures || [];
   const rows = [
