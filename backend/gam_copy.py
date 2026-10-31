@@ -1224,7 +1224,13 @@ def _update_with_inventory_handling(
     target: Any,
     target_id: int,
 ) -> tuple[List[Any], bool]:
-    """Atualiza; em NOT_ENOUGH_INVENTORY, libera, atualiza e reserva novamente."""
+    """
+    Atualiza o Line Item.
+
+    Se o GAM retornar NOT_ENOUGH_INVENTORY, ReleaseLineItems só é usado quando
+    o destino está realmente RESERVED. Para destinos não reservados, a ação
+    ReleaseLineItems não é aplicável e o par é encerrado sem afetar os demais.
+    """
     try:
         result = _call_with_concurrent_retry(
             lambda: line_item_service.updateLineItems([target]),
@@ -1235,10 +1241,32 @@ def _update_with_inventory_handling(
         if not _is_not_enough_inventory_error(error):
             raise
 
+    current = get_line_item(line_item_service, target_id)
+    reservation_status = str(
+        _get_field(current, "reservationStatus", "") or ""
+    ).upper()
+
+    print(
+        "NOT_ENOUGH_INVENTORY no destino "
+        f"{target_id}; reservationStatus={reservation_status or 'NÃO INFORMADO'}.",
+        flush=True,
+    )
+
+    if reservation_status != "RESERVED":
+        raise RuntimeError(
+            "O GAM informou inventário insuficiente, mas o Line Item destino "
+            f"está com reservationStatus={reservation_status or 'NÃO INFORMADO'}. "
+            "ReleaseLineItems não será executado porque a ação não é aplicável "
+            "a esse estado."
+        )
+
     statement = _statement_for_line_item(target_id)
-    line_item_service.performLineItemAction(
-        {"xsi_type": "ReleaseLineItems"},
-        statement,
+    _call_with_concurrent_retry(
+        lambda: line_item_service.performLineItemAction(
+            {"xsi_type": "ReleaseLineItems"},
+            statement,
+        ),
+        "Liberação da reserva do Line Item",
     )
 
     refreshed = get_line_item(line_item_service, target_id)
@@ -1251,7 +1279,10 @@ def _update_with_inventory_handling(
         lambda: line_item_service.updateLineItems([refreshed]),
         "Atualização do Line Item após liberação de inventário",
     )
-    _reserve_with_overbook(line_item_service, target_id)
+    _call_with_concurrent_retry(
+        lambda: _reserve_with_overbook(line_item_service, target_id),
+        "Reserva com overbook do Line Item",
+    )
     return list(result or []), True
 
 
@@ -1563,14 +1594,33 @@ def copiar_configuracao(
                 _rollback_line_item()
             except Exception as rollback_update_error:
                 if _is_not_enough_inventory_error(rollback_update_error):
+                    current_rollback_target = get_line_item(
+                        line_item_service, target_id
+                    )
+                    current_reservation_status = str(
+                        _get_field(
+                            current_rollback_target,
+                            "reservationStatus",
+                            "",
+                        )
+                        or ""
+                    ).upper()
+
+                    if current_reservation_status != "RESERVED":
+                        raise RuntimeError(
+                            "Rollback recebeu NOT_ENOUGH_INVENTORY, mas o "
+                            "destino não está RESERVED; ReleaseLineItems não "
+                            "será executado em estado incompatível."
+                        ) from rollback_update_error
+
                     statement = _statement_for_line_item(target_id)
-                    try:
-                        line_item_service.performLineItemAction(
+                    _call_with_concurrent_retry(
+                        lambda: line_item_service.performLineItemAction(
                             {"xsi_type": "ReleaseLineItems"},
                             statement,
-                        )
-                    except Exception:
-                        pass
+                        ),
+                        "Liberação da reserva durante rollback",
+                    )
                     _rollback_line_item()
                 else:
                     raise
