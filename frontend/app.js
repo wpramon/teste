@@ -39,10 +39,10 @@ function parseCodes(value) {
 function validate() {
   const origins = parseCodes(sourceCodes.value);
   const destinations = parseCodes(targetCodes.value);
-  const invalid = [...origins, ...destinations].filter(v => !/^\d{5,6}$/.test(v));
+  const invalid = [...origins, ...destinations].filter(v => !/^\d{6}$/.test(v));
   let error = "";
 
-  if (invalid.length) error = `Use somente códigos de 5 a 6 dígitos. Inválidos: ${[...new Set(invalid)].join(", ")}`;
+  if (invalid.length) error = `Use somente códigos de exatamente 6 dígitos. Inválidos: ${[...new Set(invalid)].join(", ")}`;
   else if (origins.length !== destinations.length && (origins.length || destinations.length)) error = `Quantidades diferentes: ${origins.length} origem(ns) e ${destinations.length} destino(s).`;
   else if (new Set(destinations).size !== destinations.length) error = "Existe código repetido na lista de destino.";
   else if (origins.some((code, i) => code === destinations[i])) error = "Há um par com o mesmo código na origem e no destino.";
@@ -350,7 +350,7 @@ function setBusy(busy) {
 function validateStateOnly() {
   const origins = parseCodes(sourceCodes.value);
   const destinations = parseCodes(targetCodes.value);
-  const invalid = [...origins, ...destinations].filter(v => !/^\d{5,6}$/.test(v));
+  const invalid = [...origins, ...destinations].filter(v => !/^\d{6}$/.test(v));
   let error = "";
   if (invalid.length) error = "invalid";
   else if (origins.length !== destinations.length && (origins.length || destinations.length)) error = "count";
